@@ -1,0 +1,23 @@
+[project]
+name = "kiln-lab"
+version = "0.1.0"
+description = "Local WebUI to discover, configure, sweep, and launch Python/Torch training scripts."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+]
+
+[project.scripts]
+kiln = "kiln.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["kiln*"]
+
+[tool.setuptools.package-data]
+kiln = ["static/*", "examples/*.py", "examples/configs/*.yaml"]

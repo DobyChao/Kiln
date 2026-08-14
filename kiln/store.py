@@ -197,11 +197,20 @@ class Store:
             return dict(row)
 
     def set_script_hidden(self, workspace_id: int, path: str, hidden: bool) -> None:
+        self.set_scripts_hidden(workspace_id, [path], hidden)
+
+    def set_scripts_hidden(self, workspace_id: int, paths: list[str], hidden: bool) -> int:
+        if not paths:
+            return 0
+        n = 0
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE script_entries SET hidden = ? WHERE workspace_id = ? AND path = ?",
-                (1 if hidden else 0, workspace_id, path),
-            )
+            for path in paths:
+                cur = conn.execute(
+                    "UPDATE script_entries SET hidden = ? WHERE workspace_id = ? AND path = ?",
+                    (1 if hidden else 0, workspace_id, path),
+                )
+                n += cur.rowcount or 0
+        return n
 
     def delete_script_entry(self, workspace_id: int, path: str) -> None:
         with self._lock, self._connect() as conn:

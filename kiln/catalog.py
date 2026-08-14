@@ -20,18 +20,32 @@ def resolve_rel(root: Path, raw: str) -> str:
     return rel.as_posix()
 
 
+def is_launchable(script: dict[str, Any]) -> bool:
+    return bool(
+        script.get("has_main")
+        or script.get("has_argparse")
+        or script.get("has_hydra")
+        or script.get("has_fire")
+        or script.get("has_click")
+    )
+
+
 def list_workspace_scripts(
     store: Store,
     ws: dict[str, Any],
     *,
     include_hidden: bool = False,
-    rescan: bool = True,
+    rescan: bool = False,
+    scan_mode: str = "all",
 ) -> list[dict[str, Any]]:
     root = Path(ws["path"])
-    scanned = scan_scripts(root) if rescan else []
-    scan_map = {s["path"]: s for s in scanned}
+    scanned: list[dict[str, Any]] = []
     if rescan:
-        store.sync_scanned(int(ws["id"]), list(scan_map))
+        scanned = scan_scripts(root)
+        if scan_mode == "launchable":
+            scanned = [s for s in scanned if is_launchable(s)]
+        store.sync_scanned(int(ws["id"]), [s["path"] for s in scanned])
+    scan_map = {s["path"]: s for s in scanned}
 
     out: list[dict[str, Any]] = []
     for entry in store.list_script_entries(int(ws["id"])):
@@ -55,6 +69,7 @@ def list_workspace_scripts(
             meta["missing"] = not (root / entry["path"]).is_file()
         meta["source"] = entry["source"]
         meta["hidden"] = bool(entry["hidden"])
+        meta["launchable"] = is_launchable(meta)
         out.append(meta)
 
     out.sort(

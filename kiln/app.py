@@ -40,7 +40,8 @@ class ScriptIn(BaseModel):
 
 
 class ScriptHideIn(BaseModel):
-    path: str
+    path: str | None = None
+    paths: list[str] | None = None
     hidden: bool = True
 
 
@@ -196,16 +197,28 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         ws = store.get_workspace(ws_id)
         if not ws:
             raise HTTPException(404, "工作区不存在")
-        scripts = list_workspace_scripts(store, ws, include_hidden=hidden, rescan=True)
+        entries = store.list_script_entries(ws_id)
+        # 空列表才扫一次，且只收可启动脚本，避免把仓库里成百上千个 .py 倒进运行列表
+        scripts = list_workspace_scripts(
+            store,
+            ws,
+            include_hidden=hidden,
+            rescan=not entries,
+            scan_mode="launchable",
+        )
         return {"workspace": ws, "scripts": scripts}
 
     @app.post("/api/workspaces/{ws_id}/scripts/scan")
-    def api_rescan(ws_id: int, hidden: bool = False) -> dict[str, Any]:
+    def api_rescan(ws_id: int, hidden: bool = False, mode: str = "launchable") -> dict[str, Any]:
         ws = store.get_workspace(ws_id)
         if not ws:
             raise HTTPException(404, "工作区不存在")
-        scripts = list_workspace_scripts(store, ws, include_hidden=hidden, rescan=True)
-        return {"workspace": ws, "scripts": scripts, "count": len(scripts)}
+        if mode not in {"launchable", "all"}:
+            raise HTTPException(400, "mode 需为 launchable 或 all")
+        scripts = list_workspace_scripts(
+            store, ws, include_hidden=hidden, rescan=True, scan_mode=mode
+        )
+        return {"workspace": ws, "scripts": scripts, "count": len(scripts), "mode": mode}
 
     @app.post("/api/workspaces/{ws_id}/scripts")
     def api_add_script(ws_id: int, body: ScriptIn) -> dict[str, Any]:
@@ -224,8 +237,13 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         ws = store.get_workspace(ws_id)
         if not ws:
             raise HTTPException(404, "工作区不存在")
-        store.set_script_hidden(ws_id, body.path, body.hidden)
-        return {"ok": True}
+        paths = list(body.paths or [])
+        if body.path:
+            paths.append(body.path)
+        if not paths:
+            raise HTTPException(400, "需要 path 或 paths")
+        count = store.set_scripts_hidden(ws_id, paths, body.hidden)
+        return {"ok": True, "count": count}
 
     @app.delete("/api/workspaces/{ws_id}/scripts")
     def api_delete_script(ws_id: int, path: str) -> dict[str, Any]:
@@ -395,6 +413,17 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    assets_dir = STATIC_DIR / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/favicon.svg")
+    def favicon() -> FileResponse:
+        icon = STATIC_DIR / "favicon.svg"
+        if not icon.is_file():
+            raise HTTPException(404, "favicon not found")
+        return FileResponse(icon)
 
     @app.get("/")
     def index() -> FileResponse:

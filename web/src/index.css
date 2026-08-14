@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Instrument Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei",
+    ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+
+  --color-bg: #13110e;
+  --color-sidebar: #191612;
+  --color-panel: #201c18;
+  --color-hover: #2a251f;
+  --color-line: #3a342c;
+  --color-text: #f3eee6;
+  --color-muted: #9c9488;
+  --color-ember: #e25b2a;
+  --color-ember-soft: #3a1c12;
+  --color-ok: #2f9e7d;
+  --color-ok-soft: #14352c;
+  --color-bad: #e05a4e;
+  --color-bad-soft: #3a1a18;
+  --color-warn: #d89a2a;
+  --color-warn-soft: #3a2d12;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+}
+
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  opacity: 0.04;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='.9'/%3E%3C/svg%3E");
+}
+
+#root {
+  isolation: isolate;
+}
+
+::selection {
+  background: #e25b2a55;
+}
+
+@layer base {
+  input,
+  select,
+  textarea,
+  button {
+    font-family: inherit;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    width: 100%;
+    border: 1px solid var(--color-line);
+    background: #181511;
+    color: var(--color-text);
+    border-radius: 0.5rem;
+    padding: 0.5rem 0.7rem;
+    outline: none;
+  }
+
+  input[type="checkbox"],
+  input[type="radio"] {
+    width: auto;
+    accent-color: var(--color-ember);
+  }
+
+  input:focus,
+  select:focus,
+  textarea:focus {
+    border-color: var(--color-ember);
+    box-shadow: 0 0 0 3px #e25b2a33;
+  }
+
+  textarea {
+    min-height: 4.5rem;
+    resize: vertical;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+  }
+
+  select {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' stroke='%239c9488' stroke-width='1.4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.7rem center;
+    padding-right: 2rem;
+  }
+}
+
+.log-shell {
+  font-variant-ligatures: none;
+}

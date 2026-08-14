@@ -20,4 +20,4 @@ build-backend = "setuptools.build_meta"
 include = ["kiln*"]
 
 [tool.setuptools.package-data]
-kiln = ["static/*", "examples/*.py", "examples/configs/*.yaml"]
+kiln = ["static/**/*", "examples/*.py", "examples/configs/*.yaml"]

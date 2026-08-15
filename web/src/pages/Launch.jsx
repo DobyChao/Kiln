@@ -5,11 +5,51 @@ import { useKiln } from "../context/KilnContext";
 import { adapterLabel, hasCuda, rememberWorkspace } from "../lib/format";
 import { Button, Empty, Field, Hint, PageHeader, Panel, Toggle } from "../components/ui";
 
+function isNargsList(arg) {
+  const n = arg?.nargs;
+  if (n === "+" || n === "*") return true;
+  if (typeof n === "number" && n > 1) return true;
+  return Array.isArray(arg?.default);
+}
+
+function formatNargs(val) {
+  if (Array.isArray(val)) return val.map((x) => (Array.isArray(x) ? formatNargs(x) : String(x))).join(" ");
+  if (val == null) return "";
+  return String(val);
+}
+
+function parseNargsInput(arg, raw) {
+  return String(raw ?? "")
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => coerceArg(arg, s));
+}
+
+function coerceArg(arg, raw) {
+  if (!arg) return raw;
+  if (arg.type === "int" && raw !== "" && !Number.isNaN(Number(raw))) return Number(raw);
+  if (arg.type === "float" && raw !== "" && !Number.isNaN(Number(raw))) return Number(raw);
+  if (arg.type === "bool") return isTruthy(raw);
+  return raw;
+}
+
 function defaultValue(arg) {
+  if (isNargsList(arg)) {
+    if (Array.isArray(arg.default)) return arg.default.join(" ");
+    if (arg.default !== undefined && arg.default !== null) return String(arg.default);
+    return "";
+  }
   if (arg.default !== undefined && arg.default !== null) return arg.default;
   if (arg.action === "store_true") return false;
   if (arg.action === "store_false") return true;
   return "";
+}
+
+function formatDefault(arg) {
+  if (arg.default === undefined || arg.default === null) return "";
+  if (Array.isArray(arg.default)) return arg.default.join(" ");
+  return String(arg.default);
 }
 
 function choiceList(arg) {
@@ -30,13 +70,19 @@ function isTruthy(v) {
   return v === true || v === "true" || v === "1" || v === 1;
 }
 
-function collectPayload(wsId, script, state) {
+function collectPayload(wsId, script, state, spec) {
+  const byDest = Object.fromEntries((spec?.args || []).map((a) => [a.dest, a]));
   const values = {};
   let sweep = false;
   for (const [k, arr] of Object.entries(state.values)) {
+    const arg = byDest[k];
     const clean = arr.map((v) => (v === "" ? null : v)).filter((v) => v !== null && v !== undefined);
     if (!clean.length) continue;
-    if (clean.length > 1) {
+    if (isNargsList(arg)) {
+      const lists = clean.map((v) => (Array.isArray(v) ? v : parseNargsInput(arg, v)));
+      values[k] = lists;
+      if (lists.length > 1) sweep = true;
+    } else if (clean.length > 1) {
       values[k] = clean;
       sweep = true;
     } else values[k] = clean[0];
@@ -78,11 +124,14 @@ export default function Launch() {
   const navigate = useNavigate();
   const { gpu, settings, setSettings, toast } = useKiln();
   const [error, setError] = useState("");
+  const [cliText, setCliText] = useState("");
   const [ready, setReady] = useState(null);
   const [L, setL] = useState(null);
   const [preview, setPreview] = useState({ text: "预览命令…", hint: "", count: 1 });
 
   const cuda = hasCuda(gpu);
+  const specRef = useRef(null);
+  specRef.current = ready?.spec;
 
   useEffect(() => {
     if (!script) return;
@@ -131,7 +180,7 @@ export default function Launch() {
   }, [wsId, script]);
 
   const runPreview = useCallback(async (state, notify) => {
-    const payload = collectPayload(wsId, script, state);
+    const payload = collectPayload(wsId, script, state, specRef.current);
     try {
       const data = await api("/preview", { method: "POST", body: payload });
       const plans = data.plans || (data.commands || []).map((command) => ({ command, gpu: null }));
@@ -178,11 +227,8 @@ export default function Launch() {
 
   function coerce(dest, raw) {
     const arg = (ready?.spec.args || []).find((a) => a.dest === dest);
-    if (!arg) return raw;
-    if (arg.type === "int" && raw !== "" && !Number.isNaN(Number(raw))) return Number(raw);
-    if (arg.type === "float" && raw !== "" && !Number.isNaN(Number(raw))) return Number(raw);
-    if (arg.type === "bool") return isTruthy(raw);
-    return raw;
+    if (isNargsList(arg)) return raw;
+    return coerceArg(arg, raw);
   }
 
   function patch(fn) {
@@ -190,10 +236,14 @@ export default function Launch() {
   }
 
   async function doLaunch() {
-    const payload = collectPayload(wsId, script, L);
+    const payload = collectPayload(wsId, script, L, ready.spec);
     const missing = (ready.spec.args || []).filter((arg) => {
       if (!arg.required) return false;
       const v = payload.values[arg.dest];
+      if (isNargsList(arg)) {
+        const items = Array.isArray(v) ? v.flat() : [];
+        return !items.length;
+      }
       return v === undefined || v === null || v === "";
     });
     if (missing.length) {
@@ -215,7 +265,7 @@ export default function Launch() {
       toast("先填一个预设名称");
       return;
     }
-    const payload = collectPayload(wsId, script, L);
+    const payload = collectPayload(wsId, script, L, ready.spec);
     try {
       await api("/presets", {
         method: "POST",
@@ -229,14 +279,22 @@ export default function Launch() {
     }
   }
 
+  function valueSlots(arg, v) {
+    if (v === undefined) return [defaultValue(arg)];
+    if (isNargsList(arg)) {
+      if (Array.isArray(v) && v.length && Array.isArray(v[0])) return v.map(formatNargs);
+      return [formatNargs(v)];
+    }
+    return Array.isArray(v) ? v : [v];
+  }
+
   function applyPreset(id) {
     const preset = L.presets.find((p) => p.id === id);
     if (!preset) return;
     const p = preset.payload || {};
     const values = {};
     for (const arg of ready.spec.args || []) {
-      const v = p.values?.[arg.dest];
-      values[arg.dest] = Array.isArray(v) ? v : [v ?? defaultValue(arg)];
+      values[arg.dest] = valueSlots(arg, p.values?.[arg.dest]);
     }
     let overrideRows = Object.entries(p.override_dims || {}).map(([key, val]) => ({
       key,
@@ -261,6 +319,56 @@ export default function Launch() {
       adjusted: [],
     }));
     toast(`已套用 ${preset.name}`);
+  }
+
+  async function deletePreset(id, name) {
+    if (!confirm(`删除预设「${name}」？`)) return;
+    try {
+      await api(`/presets/${id}`, { method: "DELETE" });
+      const data = await api(`/presets?workspace_id=${wsId}&script=${encodeURIComponent(script)}`);
+      patch((prev) => ({ ...prev, presets: data.presets || [] }));
+      toast("已删除预设");
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  async function applyCli() {
+    const command = cliText.trim();
+    if (!command) {
+      toast("先粘贴一条命令");
+      return;
+    }
+    try {
+      const data = await api("/parse-cli", {
+        method: "POST",
+        body: { workspace_id: Number(wsId), script, command },
+      });
+      const values = { ...L.values };
+      for (const arg of ready.spec.args || []) {
+        if (data.values && Object.prototype.hasOwnProperty.call(data.values, arg.dest)) {
+          values[arg.dest] = valueSlots(arg, data.values[arg.dest]);
+        }
+      }
+      let overrideRows = L.overrideRows;
+      if (data.override_dims && Object.keys(data.override_dims).length) {
+        overrideRows = Object.entries(data.override_dims).map(([key, val]) => ({
+          key,
+          vals: Array.isArray(val) ? val : [val],
+        }));
+      }
+      patch((prev) => ({
+        ...prev,
+        values,
+        extra: data.extra || prev.extra,
+        overrideRows,
+        adjusted: [],
+      }));
+      const n = Object.keys(data.values || {}).length;
+      toast(n ? `已填入 ${n} 个参数` : "没有识别到已知参数，已放进额外参数");
+    } catch (err) {
+      toast(err.message);
+    }
   }
 
   const pythonOptions = useMemo(() => {
@@ -307,18 +415,32 @@ export default function Launch() {
           </Link>
         }
       />
-      <Hint title="这一页">
-        左侧是参数（解析自 argparse / Hydra / Fire / Click）。同一参数点「+ 多值」会生成一组消融任务。预设用来保存常用组合。确认右侧预览后再点「运行」。
+      <Hint>
+        左侧是参数。nargs=+ 的框用空格填写多个值（如 1 2 3 4，逗号也可以）。「+ 多值」是消融，会变成多条任务。可把一整条命令粘贴到预设里解析进表单。
       </Hint>
       <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(300px,380px)]">
         <div className="min-w-0 space-y-4">
           <Panel>
             <h2 className="mb-3 text-[15px] font-semibold">预设</h2>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="mb-3 flex flex-wrap items-center gap-2">
               {L.presets.map((p) => (
-                <Button key={p.id} size="sm" onClick={() => applyPreset(p.id)}>
-                  {p.name}
-                </Button>
+                <span key={p.id} className="inline-flex overflow-hidden rounded-lg border border-line">
+                  <button
+                    type="button"
+                    className="px-2.5 py-1 text-xs hover:bg-hover"
+                    onClick={() => applyPreset(p.id)}
+                  >
+                    {p.name}
+                  </button>
+                  <button
+                    type="button"
+                    className="border-l border-line px-1.5 text-xs text-muted hover:bg-bad-soft hover:text-bad"
+                    title={`删除 ${p.name}`}
+                    onClick={() => deletePreset(p.id, p.name)}
+                  >
+                    ×
+                  </button>
+                </span>
               ))}
               <input
                 className="max-w-40"
@@ -330,6 +452,16 @@ export default function Launch() {
                 保存当前
               </Button>
             </div>
+            <Field label="从命令行填入当前表单">
+              <textarea
+                value={cliText}
+                onChange={(e) => setCliText(e.target.value)}
+                placeholder="python train.py --aa 1 2 3 4 --lr 1e-4"
+              />
+            </Field>
+            <Button size="sm" className="mt-2" onClick={applyCli}>
+              解析并填入
+            </Button>
           </Panel>
           <Panel>
             <h2 className="mb-3 text-[15px] font-semibold">参数</h2>
@@ -557,19 +689,23 @@ function ArgRow({ arg, vals, tweaked, onChange, onSweep }) {
   const singleChoice = arg.choices && arg.choices.length && vals.length <= 1;
 
   return (
-    <div className="border-b border-line py-3 last:border-b-0">
-      <div className="flex items-baseline justify-between gap-3">
-        <span className="font-mono text-[13px]">
+    <div className="min-w-0 border-b border-line py-3 last:border-b-0">
+      <div className="flex min-w-0 items-baseline justify-between gap-3">
+        <span className="min-w-0 font-mono text-[13px] break-all">
           {arg.name} {req ? <span className="text-bad">*</span> : null}
         </span>
-        <span className="text-xs text-muted">
+        <span className="min-w-0 max-w-[45%] text-right text-xs break-all text-muted">
           {arg.type || ""}
-          {arg.default !== undefined && arg.default !== null ? ` · 默认 ${arg.default}` : ""}
+          {arg.nargs ? ` · nargs=${arg.nargs}` : ""}
+          {arg.default !== undefined && arg.default !== null ? ` · 默认 ${formatDefault(arg)}` : ""}
         </span>
       </div>
-      {arg.help ? <div className="mt-1 text-xs text-muted">{arg.help}</div> : null}
+      {arg.help ? <div className="mt-1 min-w-0 text-xs break-all text-muted">{arg.help}</div> : null}
+      {isNargsList(arg) ? (
+        <div className="mt-1 text-xs text-muted">空格分隔多个值，对应 --flag 1 2 3 4；逗号也会当成分隔符。点「+ 多值」才是消融成多条任务。</div>
+      ) : null}
       {tweaked ? (
-        <div className="mt-1 text-xs text-muted">
+        <div className="mt-1 min-w-0 text-xs break-all text-muted">
           本机没有 CUDA，已从默认 {String(arg.default)} 改为 {String(vals[0])}
         </div>
       ) : null}
@@ -604,7 +740,8 @@ function ArgRow({ arg, vals, tweaked, onChange, onSweep }) {
                 >
                   <input
                     className="min-w-0 flex-1 border-0 bg-transparent py-1 pr-2 pl-2"
-                    value={v}
+                    value={Array.isArray(v) ? formatNargs(v) : v}
+                    placeholder={isNargsList(arg) ? "1 2 3 4" : undefined}
                     onChange={(e) => {
                       const next = [...vals];
                       next[i] = e.target.value;

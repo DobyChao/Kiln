@@ -124,7 +124,7 @@ export default function Jobs() {
           </>
         }
       />
-      <Hint title="这一页">
+      <Hint>
         运行中的卡片会显示最近几行输出。点任务名称打开完整日志（进度条会在同一行刷新）。可停止单个、整组或全部在跑的进程。
       </Hint>
       {gpus.length ? (

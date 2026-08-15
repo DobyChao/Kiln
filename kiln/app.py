@@ -15,7 +15,7 @@ from kiln.catalog import list_workspace_scripts, resolve_rel
 from kiln.gpu import gpu_info
 from kiln.interpreters import discover_interpreters
 from kiln.jobs import JobManager, attach_tails, gpu_tokens, job_brief, preview_plans, read_log
-from kiln.parser import parse_script
+from kiln.parser import parse_cli, parse_script
 from kiln.store import Store
 
 PKG_DIR = Path(__file__).resolve().parent
@@ -65,6 +65,12 @@ class LaunchIn(BaseModel):
     python: str | None = None
     cwd: str | None = None
     sweep: bool = False
+
+
+class ParseCliIn(BaseModel):
+    workspace_id: int
+    script: str
+    command: str
 
 
 class SettingsIn(BaseModel):
@@ -263,6 +269,19 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         spec["script"] = script
         spec["abs"] = str(path)
         return spec
+
+    @app.post("/api/parse-cli")
+    def api_parse_cli(body: ParseCliIn) -> dict[str, Any]:
+        ws = store.get_workspace(body.workspace_id)
+        if not ws:
+            raise HTTPException(404, "工作区不存在")
+        path = _safe_script(Path(ws["path"]), body.script)
+        spec = parse_script(path)
+        if not (body.command or "").strip():
+            raise HTTPException(400, "请粘贴一条命令")
+        parsed = parse_cli(spec, body.command)
+        parsed["kind"] = spec.get("kind")
+        return parsed
 
     @app.get("/api/presets")
     def api_presets(workspace_id: int, script: str) -> dict[str, Any]:

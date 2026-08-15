@@ -51,14 +51,17 @@ export function Empty({ title, children }) {
   );
 }
 
-export function Hint({ title, children, defaultOpen = false }) {
+export function Hint({ title = "Tips", children, defaultOpen = false }) {
   return (
-    <details
-      className="mb-5 rounded-xl border border-ember/25 bg-ember-soft/70 px-4 py-3 text-sm"
-      open={defaultOpen}
-    >
-      <summary className="cursor-pointer select-none font-medium text-text">{title}</summary>
-      <div className="mt-2 text-muted [&_ol]:mt-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_code]:rounded [&_code]:bg-hover [&_code]:px-1">
+    <details className="group mb-5" open={defaultOpen}>
+      <summary className="flex w-fit cursor-pointer list-none items-center gap-2 rounded-full border border-line bg-panel py-1 pr-2.5 pl-1.5 text-[11px] font-medium text-muted select-none hover:border-ember/35 hover:text-text [&::-webkit-details-marker]:hidden">
+        <span className="grid h-5 w-5 place-items-center rounded-full bg-ember-soft font-mono text-[10px] font-semibold text-ember">
+          ?
+        </span>
+        <span className="tracking-[0.16em] uppercase">{title}</span>
+        <span className="text-[9px] text-muted/80 transition-transform group-open:rotate-180">▼</span>
+      </summary>
+      <div className="mt-2 max-w-2xl border-l-2 border-ember/50 py-0.5 pl-3.5 text-[13px] leading-relaxed text-muted [&_ol]:mt-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_p]:mt-1.5 [&_code]:rounded [&_code]:bg-hover [&_code]:px-1 [&_code]:text-text">
         {children}
       </div>
     </details>

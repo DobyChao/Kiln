@@ -165,7 +165,7 @@ export default function Scripts() {
           </>
         }
       />
-      <Hint title="这一页">
+      <Hint>
         列表是「要跑的脚本」，不是仓库文件浏览器。第一次进入只自动收有 main / argparse / Hydra / Fire / Click
         的文件。漏掉的用「扫描全部」或手动添加；不需要的可勾选后批量移除（不删磁盘文件）。
       </Hint>

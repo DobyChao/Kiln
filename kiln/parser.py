@@ -473,8 +473,8 @@ def build_argv(
             continue
         flag = arg["name"] if arg["name"].startswith("-") else f"--{arg['dest']}"
         nargs = arg.get("nargs")
-        if nargs in {"+", "*"} or isinstance(val, list):
-            items = val if isinstance(val, list) else str(val).split()
+        if nargs in {"+", "*"} or isinstance(nargs, int) and nargs > 1 or isinstance(val, list):
+            items = _nargs_items(val)
             if items:
                 argv.append(flag)
                 argv.extend(str(x) for x in items)
@@ -483,6 +483,22 @@ def build_argv(
 
     argv.extend(_split_extra(extra))
     return argv
+
+
+def _nargs_items(val: Any) -> list[Any]:
+    if isinstance(val, list):
+        if len(val) == 1 and isinstance(val[0], list):
+            return val[0]
+        return val
+    return [p for p in _split_tokens(str(val)) if p != ""]
+
+
+def _split_tokens(raw: str) -> list[str]:
+    out: list[str] = []
+    for part in raw.replace(",", " ").split():
+        if part:
+            out.append(part)
+    return out
 
 
 def _truthy(val: Any) -> bool:
@@ -507,3 +523,143 @@ def _split_extra(extra: str) -> list[str]:
         return shlex.split(extra, posix=posix)
     except ValueError:
         return extra.split()
+
+
+def _is_python_or_script(token: str) -> bool:
+    name = Path(token.replace("\\", "/")).name.lower()
+    if name.endswith(".py"):
+        return True
+    if "python" in name:
+        return True
+    return False
+
+
+def _looks_negative_number(token: str) -> bool:
+    try:
+        float(token)
+        return token.startswith("-")
+    except ValueError:
+        return False
+
+
+def _coerce_cli(arg: dict[str, Any], raw: str) -> Any:
+    t = arg.get("type")
+    if t == "int":
+        try:
+            return int(raw, 10)
+        except ValueError:
+            return raw
+    if t == "float":
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+    if t == "bool":
+        return _truthy(raw)
+    return raw
+
+
+def _is_nargs_list(arg: dict[str, Any]) -> bool:
+    n = arg.get("nargs")
+    if n in {"+", "*"}:
+        return True
+    if isinstance(n, int) and n > 1:
+        return True
+    return isinstance(arg.get("default"), list)
+
+
+def parse_cli(spec: dict[str, Any], command: str) -> dict[str, Any]:
+    """Fill form values from a pasted command line."""
+    import shlex
+    import sys
+
+    posix = sys.platform != "win32"
+    try:
+        tokens = shlex.split((command or "").strip(), posix=posix)
+    except ValueError:
+        tokens = (command or "").split()
+
+    while tokens and _is_python_or_script(tokens[0]):
+        tokens.pop(0)
+
+    args = spec.get("args") or []
+    by_flag: dict[str, dict[str, Any]] = {}
+    for arg in args:
+        for flag in arg.get("flags") or [arg.get("name")]:
+            if flag:
+                by_flag[str(flag)] = arg
+
+    values: dict[str, Any] = {}
+    extra: list[str] = []
+    overrides: list[str] = []
+    i = 0
+    kind = spec.get("kind")
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            extra.extend(tokens[i + 1 :])
+            break
+        if kind == "hydra" and "=" in tok and not tok.startswith("-"):
+            overrides.append(tok)
+            i += 1
+            continue
+        flag, eq = tok, None
+        if tok.startswith("--") and "=" in tok:
+            flag, eq = tok.split("=", 1)
+        arg = by_flag.get(flag)
+        if arg is None:
+            extra.append(tok)
+            i += 1
+            continue
+        dest = arg["dest"]
+        action = arg.get("action") or "store"
+        if action == "store_true":
+            values[dest] = False if eq in {"0", "false", "False"} else True
+            i += 1
+            continue
+        if action == "store_false":
+            values[dest] = True if eq in {"0", "false", "False"} else False
+            i += 1
+            continue
+        taken: list[Any] = []
+        if eq is not None:
+            taken.extend(_coerce_cli(arg, p) for p in _split_tokens(eq) or [eq])
+            i += 1
+        else:
+            i += 1
+            narg = arg.get("nargs")
+            if _is_nargs_list(arg):
+                limit = narg if isinstance(narg, int) else None
+                while i < len(tokens):
+                    nxt = tokens[i]
+                    if nxt in by_flag or (nxt.startswith("-") and not _looks_negative_number(nxt)):
+                        break
+                    taken.append(_coerce_cli(arg, nxt))
+                    i += 1
+                    if limit is not None and len(taken) >= limit:
+                        break
+            elif i < len(tokens):
+                nxt = tokens[i]
+                if nxt not in by_flag and (not nxt.startswith("-") or _looks_negative_number(nxt)):
+                    taken.append(_coerce_cli(arg, nxt))
+                    i += 1
+        if _is_nargs_list(arg):
+            values[dest] = taken
+        elif taken:
+            values[dest] = taken[0]
+        else:
+            extra.append(flag)
+
+    extra_s = " ".join(extra).strip()
+    override_dims: dict[str, Any] = {}
+    for ov in overrides:
+        if "=" not in ov:
+            continue
+        key, val = ov.split("=", 1)
+        override_dims[key] = val
+    return {
+        "values": values,
+        "extra": extra_s,
+        "overrides": overrides,
+        "override_dims": override_dims,
+    }

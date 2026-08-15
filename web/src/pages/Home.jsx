@@ -60,7 +60,7 @@ export default function Home() {
         title="你的训练项目"
         lede="把仓库根目录加进来。Kiln 会列出 Python 脚本，把命令行参数变成表单，确认后再运行，不必手敲一长串 CLI。"
       />
-      <Hint title="怎么用" defaultOpen>
+      <Hint defaultOpen>
         <ol>
           <li>
             填写下面的项目路径（Windows 如 <code>D:\research\cls</code>，Linux 如 <code>/data/exp</code>

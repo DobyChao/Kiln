@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { STATUS } from "../lib/format";
 
 export function Button({
@@ -42,6 +43,60 @@ export function Field({ label, className = "", children }) {
   );
 }
 
+/** Local draft; commits a valid integer on blur / Enter. Empty and out-of-range values do not POST. */
+export function CommitNumber({ value, min = 1, max = 64, onCommit, className = "", ...props }) {
+  const [draft, setDraft] = useState(() => String(value ?? ""));
+
+  useEffect(() => {
+    setDraft(String(value ?? ""));
+  }, [value]);
+
+  function parse() {
+    const n = Number(String(draft).trim());
+    if (!Number.isInteger(n) || n < min || n > max) return null;
+    return n;
+  }
+
+  async function commit() {
+    const n = parse();
+    if (n == null) {
+      setDraft(String(value ?? ""));
+      return;
+    }
+    if (n === value) return;
+    try {
+      await onCommit(n);
+    } catch {
+      setDraft(String(value ?? ""));
+    }
+  }
+
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      pattern="[0-9]*"
+      autoComplete="off"
+      spellCheck={false}
+      className={className}
+      value={draft}
+      title={`${min}–${max}，输完后点别处或回车生效`}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        commit();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        if (e.key === "Escape") {
+          setDraft(String(value ?? ""));
+          e.currentTarget.blur();
+        }
+      }}
+      {...props}
+    />
+  );
+}
+
 export function Empty({ title, children }) {
   return (
     <div className="rounded-xl border border-dashed border-line bg-panel/40 px-5 py-10 text-center text-muted">
@@ -51,9 +106,9 @@ export function Empty({ title, children }) {
   );
 }
 
-export function Hint({ title = "Tips", children, defaultOpen = false }) {
+export function Hint({ title = "Tips", children, defaultOpen = false, className = "" }) {
   return (
-    <details className="group mb-5" open={defaultOpen}>
+    <details className={`group ${className || "mb-5"}`} open={defaultOpen}>
       <summary className="flex w-fit cursor-pointer list-none items-center gap-2 rounded-full border border-line bg-panel py-1 pr-2.5 pl-1.5 text-[11px] font-medium text-muted select-none hover:border-ember/35 hover:text-text [&::-webkit-details-marker]:hidden">
         <span className="grid h-5 w-5 place-items-center rounded-full bg-ember-soft font-mono text-[10px] font-semibold text-ember">
           ?
@@ -61,7 +116,7 @@ export function Hint({ title = "Tips", children, defaultOpen = false }) {
         <span className="tracking-[0.16em] uppercase">{title}</span>
         <span className="text-[9px] text-muted/80 transition-transform group-open:rotate-180">▼</span>
       </summary>
-      <div className="mt-2 max-w-2xl border-l-2 border-ember/50 py-0.5 pl-3.5 text-[13px] leading-relaxed text-muted [&_ol]:mt-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_p]:mt-1.5 [&_code]:rounded [&_code]:bg-hover [&_code]:px-1 [&_code]:text-text">
+      <div className="mt-2 max-w-2xl border-l-2 border-ember/50 py-0.5 pl-3.5 text-[13px] leading-relaxed text-muted [&_ol]:mt-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_ul]:mt-1.5 [&_ul]:list-disc [&_ul]:pl-4 [&_li+li]:mt-1.5 [&_p]:mt-1.5 [&_code]:rounded [&_code]:bg-hover [&_code]:px-1 [&_code]:text-text">
         {children}
       </div>
     </details>
@@ -84,9 +139,9 @@ export function StatusBadge({ status }) {
   );
 }
 
-export function PageHeader({ kicker, title, lede, actions }) {
+export function PageHeader({ kicker, title, lede, actions, className = "" }) {
   return (
-    <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+    <div className={`mb-5 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between ${className}`}>
       <div className="min-w-0">
         {kicker && <p className="mb-1 text-xs text-muted">{kicker}</p>}
         <h1 className="text-2xl font-semibold tracking-tight text-text sm:text-[1.75rem]">{title}</h1>

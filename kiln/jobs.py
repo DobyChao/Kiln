@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -49,17 +50,59 @@ def _unwrap(values: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_UNSAFE = re.compile(r'[<>:"/\\|?*\s]+')
+
+
+def _token(value: Any) -> str:
+    """Make a swept value safe to drop into a path segment."""
+    text = "" if value is None else str(value)
+    return _UNSAFE.sub("-", text.strip()).strip("-.") or "na"
+
+
+def render_template(template: str, combo: dict[str, Any], index: int, total: int) -> str:
+    width = len(str(total))
+
+    def sub(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key == "i":
+            return str(index).zfill(width)
+        if key == "n":
+            return str(total)
+        if key in combo:
+            return _token(combo[key])
+        return match.group(0)
+
+    return _PLACEHOLDER.sub(sub, template)
+
+
 def _launch_combos(
     values: dict[str, Any],
     override_dims: dict[str, Any] | None,
     sweep: bool,
+    per_run: list[str] | None = None,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     override_dims = override_dims or {}
+    values = values or {}
+    templates = {
+        key: values[key]
+        for key in (per_run or [])
+        if isinstance(values.get(key), str) and values[key] != ""
+    }
+    grid = {k: v for k, v in values.items() if k not in templates}
     if sweep:
-        v_combos = expand_sweep(values or {})
+        v_combos = expand_sweep(grid)
         o_combos = expand_sweep(override_dims) if override_dims else [{}]
-        return [(v, o) for v, o in product(v_combos, o_combos)]
-    return [(_unwrap(values), _unwrap(override_dims))]
+        pairs = [(dict(v), dict(o)) for v, o in product(v_combos, o_combos)]
+    else:
+        pairs = [(_unwrap(grid), _unwrap(override_dims))]
+    if templates:
+        total = len(pairs)
+        for index, (combo, ov_dim) in enumerate(pairs, start=1):
+            context = {**combo, **ov_dim}
+            for key, template in templates.items():
+                combo[key] = render_template(template, context, index, total)
+    return pairs
 
 
 def parse_gpu_ids(gpu: str | None) -> list[str]:
@@ -133,13 +176,14 @@ class JobManager:
         python: str | None = None,
         cwd: str | None = None,
         sweep: bool = False,
+        per_run: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         root = Path(workspace["path"]).resolve()
         script_path = (root / script_rel).resolve()
         script_path.relative_to(root)
         py = python or workspace.get("python") or sys.executable
         workdir = Path(cwd).resolve() if cwd else script_path.parent
-        pairs = _launch_combos(values, override_dims, sweep)
+        pairs = _launch_combos(values, override_dims, sweep, per_run)
         if len(pairs) > 200:
             raise ValueError(f"消融组合过多（{len(pairs)}），上限 200")
         policy = "spread" if gpu_policy == "spread" else "pin"
@@ -511,11 +555,12 @@ def preview_plans(
     gpu: str | None = None,
     gpu_policy: str = "pin",
     sweep: bool = False,
+    per_run: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     root = Path(workspace["path"]).resolve()
     script_path = (root / script_rel).resolve()
     py = python or workspace.get("python") or sys.executable
-    pairs = _launch_combos(values, override_dims, sweep)
+    pairs = _launch_combos(values, override_dims, sweep, per_run)
     if len(pairs) > 200:
         raise ValueError(f"消融组合过多（{len(pairs)}），上限 200")
     policy = "spread" if gpu_policy == "spread" else "pin"

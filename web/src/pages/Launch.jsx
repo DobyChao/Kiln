@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import { api } from "../api";
 import { useKiln } from "../context/KilnContext";
 import { adapterLabel, hasCuda, rememberWorkspace } from "../lib/format";
-import { Button, Empty, Field, Hint, PageHeader, Panel, Toggle } from "../components/ui";
+import { Button, CommitNumber, Empty, Field, Hint, PageHeader, Panel, Toggle } from "../components/ui";
 
 function isNargsList(arg) {
   const n = arg?.nargs;
@@ -56,6 +56,94 @@ function choiceList(arg) {
   return (arg.choices || []).map((c) => String(c));
 }
 
+const PLACEHOLDER = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/** Mirrors kiln/jobs.py _token: keep swept values safe inside a path segment. */
+function tokenize(value) {
+  const text = String(value ?? "").trim();
+  return text.replace(/[<>:"/\\|?*\s]+/g, "-").replace(/^[-.]+|[-.]+$/g, "") || "na";
+}
+
+function renderTemplate(template, ctx, index, total) {
+  const width = String(total).length;
+  return String(template ?? "").replace(PLACEHOLDER, (whole, key) => {
+    if (key === "i") return String(index).padStart(width, "0");
+    if (key === "n") return String(total);
+    if (Object.prototype.hasOwnProperty.call(ctx, key)) return tokenize(ctx[key]);
+    return whole;
+  });
+}
+
+const ARTIFACT = new Set([
+  "out", "output", "outputs", "outdir", "save", "savedir", "ckpt", "ckpts", "checkpoint",
+  "checkpoints", "log", "logs", "logdir", "result", "results", "exp", "run", "workdir", "name",
+]);
+const NOT_ARTIFACT = new Set([
+  "data", "input", "inputs", "load", "resume", "pretrain", "pretrained", "init", "config", "cfg",
+]);
+
+/** A template is a string, so numeric flags can't be per-run. */
+function templatable(arg) {
+  const type = String(arg.type || "").toLowerCase();
+  return type !== "int" && type !== "float" && type !== "bool";
+}
+
+/** Only used to nudge the user; a miss just means no hint. */
+function looksLikeArtifact(arg) {
+  if (!templatable(arg)) return false;
+  const tokens = `${arg.dest || ""}_${arg.name || ""}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (tokens.some((t) => NOT_ARTIFACT.has(t))) return false;
+  return tokens.some((t) => ARTIFACT.has(t));
+}
+
+function cartesianCombos(dims, fixed) {
+  if (!dims.length) return [{ ...fixed }];
+  let rows = [{}];
+  for (const dim of dims) {
+    const next = [];
+    for (const row of rows) {
+      for (const value of dim.values) next.push({ ...row, [dim.dest]: value });
+    }
+    rows = next;
+  }
+  return rows.map((row) => ({ ...fixed, ...row }));
+}
+
+/** Grid dimensions (the cartesian product) plus the value each run sees. */
+function sweepPlan(spec, state) {
+  const byDest = Object.fromEntries((spec?.args || []).map((a) => [a.dest, a]));
+  const perRun = state.perRun || [];
+  const dims = [];
+  const fixed = {};
+  for (const [dest, slots] of Object.entries(state.values || {})) {
+    if (perRun.includes(dest)) continue;
+    const arg = byDest[dest];
+    const clean = (slots || []).filter((v) => v !== "" && v !== null && v !== undefined);
+    if (!clean.length) continue;
+    fixed[dest] = clean[0];
+    if (clean.length > 1) {
+      dims.push({ dest, name: arg?.name || dest, values: clean, count: clean.length });
+    }
+  }
+  for (const row of state.overrideRows || []) {
+    const key = row.key.trim();
+    if (!key) continue;
+    const vals = row.vals.map((v) => v.trim()).filter(Boolean);
+    if (!vals.length) continue;
+    fixed[key] = vals[0];
+    if (vals.length > 1) dims.push({ dest: key, name: key, values: vals, count: vals.length });
+  }
+  const combos = cartesianCombos(dims, fixed);
+  return { dims, count: combos.length, combos, first: combos[0] || {}, last: combos[combos.length - 1] || {} };
+}
+
+function suggestTemplate(value, dims) {
+  const base = String(value ?? "").replace(/[\\/]+$/, "");
+  const tail = dims.length && dims.length <= 2 ? dims.map((d) => `{${d.dest}}`).join("-") : "{i}";
+  if (!base) return `./runs/${tail}`;
+  return /[\\/]/.test(base) ? `${base}/${tail}` : `${base}-${tail}`;
+}
+
 function preferLocalDevice(arg, value, cuda) {
   if (cuda) return value;
   const choices = choiceList(arg).map((c) => c.toLowerCase());
@@ -72,10 +160,11 @@ function isTruthy(v) {
 
 function collectPayload(wsId, script, state, spec) {
   const byDest = Object.fromEntries((spec?.args || []).map((a) => [a.dest, a]));
+  const perRun = state.perRun || [];
   const values = {};
   let sweep = false;
   for (const [k, arr] of Object.entries(state.values)) {
-    const arg = byDest[k];
+    const arg = perRun.includes(k) ? null : byDest[k];
     const clean = arr.map((v) => (v === "" ? null : v)).filter((v) => v !== null && v !== undefined);
     if (!clean.length) continue;
     if (isNargsList(arg)) {
@@ -114,6 +203,7 @@ function collectPayload(wsId, script, state, spec) {
     python: state.python || null,
     cwd: state.cwd || null,
     sweep,
+    per_run: perRun.filter((k) => typeof values[k] === "string"),
   };
 }
 
@@ -163,6 +253,7 @@ export default function Launch() {
           extra: "",
           overrideRows: spec.kind === "hydra" ? [{ key: "", vals: [""] }] : [],
           envRows: [{ key: "", value: "" }],
+          perRun: [],
           gpus: [],
           gpuPolicy: "spread",
           python: ws.python || "",
@@ -209,6 +300,7 @@ export default function Launch() {
   const previewKey = L
     ? JSON.stringify({
         values: L.values,
+        perRun: L.perRun,
         extra: L.extra,
         overrideRows: L.overrideRows,
         gpus: L.gpus,
@@ -306,6 +398,7 @@ export default function Launch() {
     patch((prev) => ({
       ...prev,
       values,
+      perRun: (p.per_run || []).filter((dest) => dest in values),
       extra: p.extra || "",
       python: p.python || prev.python,
       gpus: String(p.gpu || "")
@@ -392,10 +485,13 @@ export default function Launch() {
 
   const spec = ready.spec;
   const args = spec.args || [];
+  const plan = sweepPlan(spec, L);
+  const perRunNames = (L.perRun || []).map((dest) => args.find((a) => a.dest === dest)?.name || dest);
 
   return (
-    <>
+    <div className="@container">
       <PageHeader
+        className="mb-4"
         kicker={
           <>
             <Link to={`/ws/${wsId}`} className="text-muted underline-offset-2 hover:text-text hover:underline">
@@ -405,7 +501,7 @@ export default function Launch() {
           </>
         }
         title={script}
-        lede={spec.description || spec.error || "把命令行参数填进表单。确认右侧预览后再运行。"}
+        lede={spec.description || spec.error || "把命令行参数填进表单。确认命令预览后再运行。"}
         actions={
           <Link
             to={`/ws/${wsId}`}
@@ -415,56 +511,54 @@ export default function Launch() {
           </Link>
         }
       />
-      <Hint>
-        左侧是参数。nargs=+ 的框用空格填写多个值（如 1 2 3 4，逗号也可以）。「+ 多值」是消融，会变成多条任务。可把一整条命令粘贴到预设里解析进表单。
+      <Hint className="mb-4">
+        <ul>
+          <li>
+            <code>nargs=+</code> 的框用空格填写多个值（如 <code>1 2 3 4</code>，逗号也可以）。可把一整条命令粘贴到「从命令行填入」解析进表单。
+          </li>
+          <li>
+            消融分两堆：「+ 多值」的参数做笛卡尔积决定跑几组；「每组唯一」的参数不参与相乘，写成模板按组展开，例如{" "}
+            <code>./runs/&#123;arch&#125;-&#123;lr&#125;</code> 或 <code>./runs/exp-&#123;i&#125;</code>
+            ，用来避免几组任务把产物写到同一个目录。占位符可用 <code>&#123;i&#125;</code>（组序号）、
+            <code>&#123;n&#125;</code>（总组数）和任意参与消融的参数名。
+          </li>
+          <li>
+            脚本自己管卡时：界面上<strong className="font-medium text-text">不要选卡</strong>
+            。Kiln 不会设置 <code>CUDA_VISIBLE_DEVICES</code>
+            ，脚本里的 <code>cuda:0</code> 按机器真实编号生效。多路一起跑时把「同时跑几路」压低，避免打满同一张卡。要让
+            Kiln 排队、互斥，就把卡勾上，脚本里用相对可见设备（通常是 <code>cuda:0</code>）。
+          </li>
+        </ul>
       </Hint>
-      <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(300px,380px)]">
+      <div className="grid items-start gap-4 @[780px]:grid-cols-[minmax(0,1fr)_minmax(300px,360px)]">
         <div className="min-w-0 space-y-4">
           <Panel>
-            <h2 className="mb-3 text-[15px] font-semibold">预设</h2>
-            <div className="mb-3 flex flex-wrap items-center gap-2">
-              {L.presets.map((p) => (
-                <span key={p.id} className="inline-flex overflow-hidden rounded-lg border border-line">
-                  <button
-                    type="button"
-                    className="px-2.5 py-1 text-xs hover:bg-hover"
-                    onClick={() => applyPreset(p.id)}
-                  >
-                    {p.name}
-                  </button>
-                  <button
-                    type="button"
-                    className="border-l border-line px-1.5 text-xs text-muted hover:bg-bad-soft hover:text-bad"
-                    title={`删除 ${p.name}`}
-                    onClick={() => deletePreset(p.id, p.name)}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-              <input
-                className="max-w-40"
-                placeholder="预设名称"
-                value={L.presetName || ""}
-                onChange={(e) => patch((prev) => ({ ...prev, presetName: e.target.value }))}
-              />
-              <Button size="sm" onClick={savePreset}>
-                保存当前
-              </Button>
-            </div>
-            <Field label="从命令行填入当前表单">
-              <textarea
-                value={cliText}
-                onChange={(e) => setCliText(e.target.value)}
-                placeholder="python train.py --aa 1 2 3 4 --lr 1e-4"
-              />
-            </Field>
+            <h2 className="text-[15px] font-semibold">从命令行填入</h2>
+            <p className="mt-1 mb-2 text-xs text-muted">粘贴一整条命令，解析出来的参数会覆盖下面的表单。</p>
+            <textarea
+              value={cliText}
+              onChange={(e) => setCliText(e.target.value)}
+              placeholder="python train.py --aa 1 2 3 4 --lr 1e-4"
+            />
             <Button size="sm" className="mt-2" onClick={applyCli}>
               解析并填入
             </Button>
           </Panel>
           <Panel>
-            <h2 className="mb-3 text-[15px] font-semibold">参数</h2>
+            <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+              <h2 className="text-[15px] font-semibold">参数</h2>
+              {plan.dims.length ? (
+                <span className="text-xs text-muted">
+                  笛卡尔积 <b className="text-text">{plan.count}</b> 组 ={" "}
+                  <span className="font-mono">{plan.dims.map((d) => `${d.name}×${d.count}`).join(" × ")}</span>
+                  {perRunNames.length ? (
+                    <>
+                      {" · "}每组唯一：<span className="font-mono text-ember">{perRunNames.join(" ")}</span>
+                    </>
+                  ) : null}
+                </span>
+              ) : null}
+            </div>
             {args.length ? (
               <div>
                 {args.map((arg) => (
@@ -473,6 +567,8 @@ export default function Launch() {
                     arg={arg}
                     vals={L.values[arg.dest] ?? [defaultValue(arg)]}
                     tweaked={(L.adjusted || []).includes(arg.dest)}
+                    perRun={(L.perRun || []).includes(arg.dest)}
+                    plan={plan}
                     onChange={(vals) =>
                       patch((prev) => ({
                         ...prev,
@@ -488,6 +584,18 @@ export default function Launch() {
                         return {
                           ...prev,
                           values: { ...prev.values, [arg.dest]: [...cur, defaultValue(arg)] },
+                        };
+                      })
+                    }
+                    onPerRun={(on, template) =>
+                      patch((prev) => {
+                        const rest = (prev.perRun || []).filter((d) => d !== arg.dest);
+                        const cur = prev.values[arg.dest] || [""];
+                        const next = template === undefined ? [cur[0] ?? ""] : [template];
+                        return {
+                          ...prev,
+                          perRun: on ? [...rest, arg.dest] : rest,
+                          values: { ...prev.values, [arg.dest]: on ? next : cur },
                         };
                       })
                     }
@@ -570,20 +678,20 @@ export default function Launch() {
           </Panel>
         </div>
 
-        <div className="min-w-0 xl:sticky xl:top-4">
-          <Panel>
-            <div className="mb-2.5 text-[13px] font-semibold text-muted">运行配置</div>
-            <p className="mb-2.5 text-sm">
-              <Link to={`/ws/${wsId}`} className="text-ember no-underline hover:underline">
-                ← 返回脚本列表
-              </Link>
-            </p>
-            <Field label="设备" />
-            <GpuPick
-              gpu={gpu}
-              selected={L.gpus}
-              onChange={(gpus) => patch((prev) => ({ ...prev, gpus }))}
-            />
+        <div className="min-w-0 @[780px]:sticky @[780px]:top-4 @[780px]:self-start">
+          <Panel className="@[780px]:max-h-[calc(100dvh-8rem)] @[780px]:overflow-y-auto @[780px]:overscroll-contain">
+            <div className="mb-2 text-[13px] font-semibold text-muted">命令预览</div>
+            <pre className="max-h-40 overflow-auto rounded-lg border border-line bg-[#181511] p-3 font-mono text-xs break-all whitespace-pre-wrap text-muted">
+              {preview.text}
+            </pre>
+            {preview.hint && <p className="mt-2 text-xs text-muted">{preview.hint}</p>}
+            <div className="mt-4 mb-1 text-[13px] font-semibold text-muted">设备</div>
+            {cuda ? (
+              <p className="text-xs text-muted">
+                脚本自己管卡就别勾选，Kiln 不会动 <code className="text-text">CUDA_VISIBLE_DEVICES</code>。
+              </p>
+            ) : null}
+            <GpuPick gpu={gpu} selected={L.gpus} onChange={(gpus) => patch((prev) => ({ ...prev, gpus }))} />
             {cuda && (
               <>
                 <div className="mb-2 flex flex-col gap-1 text-[13px] text-muted">
@@ -630,76 +738,292 @@ export default function Launch() {
                 </label>
               </>
             )}
-            <Field label="同时跑几路" className="mt-2.5">
-              <input
-                type="number"
-                min={1}
-                max={64}
-                value={settings.max_concurrent}
-                onChange={async (e) => {
-                  try {
-                    const next = await api("/settings", {
-                      method: "POST",
-                      body: { max_concurrent: Number(e.target.value) },
-                    });
-                    setSettings(next);
-                  } catch (err) {
-                    toast(err.message);
-                  }
-                }}
-              />
-            </Field>
-            {!cuda && <p className="mt-1 text-xs text-muted">没有 GPU 时建议 1–2 路，避免把 CPU 打满。</p>}
-            <Field label="Python" className="mt-2.5">
-              <select value={L.python} onChange={(e) => patch((prev) => ({ ...prev, python: e.target.value }))}>
-                {pythonOptions.map((o) => (
-                  <option key={o.path || "default"} value={o.path}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="工作目录" className="mt-2.5">
-              <input
-                value={L.cwd}
-                onChange={(e) => patch((prev) => ({ ...prev, cwd: e.target.value }))}
-                placeholder="默认：脚本所在目录"
-              />
-            </Field>
-            {preview.hint && <p className="mt-3 mb-2 text-xs text-muted">{preview.hint}</p>}
-            <pre className="mt-2 max-h-48 overflow-auto rounded-lg border border-line bg-[#181511] p-3 font-mono text-xs break-all whitespace-pre-wrap text-muted">
-              {preview.text}
-            </pre>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Button onClick={() => runPreview(L, true)}>预览</Button>
-              <Button variant="solid" onClick={doLaunch}>
-                {preview.count > 1 ? `运行 × ${preview.count}` : "运行"}
-              </Button>
+            <div className="mt-4 grid gap-2.5 @[560px]:grid-cols-2 @[780px]:grid-cols-1">
+              <Field label="同时跑几路">
+                <CommitNumber
+                  value={settings.max_concurrent}
+                  min={1}
+                  max={64}
+                  onCommit={async (n) => {
+                    try {
+                      const next = await api("/settings", { method: "POST", body: { max_concurrent: n } });
+                      setSettings(next);
+                    } catch (err) {
+                      toast(err.message);
+                      throw err;
+                    }
+                  }}
+                />
+              </Field>
+              <Field label="Python">
+                <select value={L.python} onChange={(e) => patch((prev) => ({ ...prev, python: e.target.value }))}>
+                  {pythonOptions.map((o) => (
+                    <option key={o.path || "default"} value={o.path}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="工作目录" className="@[560px]:col-span-2 @[780px]:col-span-1">
+                <input
+                  value={L.cwd}
+                  onChange={(e) => patch((prev) => ({ ...prev, cwd: e.target.value }))}
+                  placeholder="默认：脚本所在目录"
+                />
+              </Field>
             </div>
+            {!cuda && <p className="mt-1.5 text-xs text-muted">没有 GPU 时建议 1–2 路，避免把 CPU 打满。</p>}
           </Panel>
         </div>
       </div>
-    </>
+
+      <div className="sticky bottom-0 z-20 -mx-4 -mb-6 mt-4 border-t border-line bg-bg/95 px-4 py-3 backdrop-blur sm:-mx-6 sm:px-6 lg:-mx-10 lg:-mb-8 lg:px-10">
+        <div className="flex flex-wrap items-center gap-2">
+          <PresetMenu
+            presets={L.presets}
+            name={L.presetName || ""}
+            onName={(presetName) => patch((prev) => ({ ...prev, presetName }))}
+            onSave={savePreset}
+            onApply={applyPreset}
+            onDelete={deletePreset}
+          />
+          {preview.hint && <span className="ml-auto hidden text-xs text-muted md:block">{preview.hint}</span>}
+          <div className={`flex gap-2 ${preview.hint ? "md:ml-0" : ""} ml-auto`}>
+            <Button onClick={() => runPreview(L, true)}>预览</Button>
+            <Button variant="solid" onClick={doLaunch}>
+              {preview.count > 1 ? `运行 × ${preview.count}` : "运行"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
-function ArgRow({ arg, vals, tweaked, onChange, onSweep }) {
+function PresetMenu({ presets, name, onName, onSave, onApply, onDelete }) {
+  const [open, setOpen] = useState(false);
+  const box = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    function onDown(e) {
+      if (!box.current?.contains(e.target)) setOpen(false);
+    }
+    function onKey(e) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative" ref={box}>
+      <Button onClick={() => setOpen((v) => !v)} aria-expanded={open} aria-haspopup="menu">
+        预设{presets.length ? ` · ${presets.length}` : ""}
+        <span className={`ml-1.5 text-[9px] text-muted transition-transform ${open ? "rotate-180" : ""}`}>▲</span>
+      </Button>
+      {open && (
+        <div className="absolute bottom-full left-0 z-30 mb-2 w-72 rounded-xl border border-[#4d453a] bg-hover p-2 shadow-[0_12px_32px_rgba(0,0,0,.6)]">
+          {presets.length ? (
+            <div className="max-h-56 overflow-y-auto overscroll-contain">
+              {presets.map((p) => (
+                <div key={p.id} className="flex items-center gap-1 rounded-lg hover:bg-line/60">
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 truncate px-2 py-1.5 text-left text-sm"
+                    title={`套用 ${p.name}`}
+                    onClick={() => {
+                      onApply(p.id);
+                      setOpen(false);
+                    }}
+                  >
+                    {p.name}
+                  </button>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-md px-2 py-1 text-xs text-muted hover:bg-bad-soft hover:text-bad"
+                    title={`删除 ${p.name}`}
+                    onClick={() => onDelete(p.id, p.name)}
+                  >
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="px-2 py-2 text-xs text-muted">还没有预设。给当前这套参数起个名字存下来，下次一键套用。</p>
+          )}
+          <div className="mt-1.5 flex gap-1.5 border-t border-line pt-2">
+            <input
+              className="min-w-0 flex-1"
+              placeholder="预设名称"
+              value={name}
+              onChange={(e) => onName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") onSave();
+              }}
+            />
+            <Button size="sm" onClick={onSave}>
+              保存当前
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function sampleValues(values, max = 3) {
+  const shown = values.slice(0, max).map((v) => String(v));
+  if (values.length > max) shown.push("…");
+  return shown.join(" / ");
+}
+
+function PerRunEditor({ template, plan, onChange, onCancel }) {
+  const inputRef = useRef(null);
+  const caret = useRef(null);
+  const dims = plan?.dims || [];
+  const combos = plan?.combos || [{}];
+  const total = combos.length || 1;
+  const hasPlaceholder = /\{[A-Za-z_][A-Za-z0-9_]*\}/.test(template);
+  const previewIdx =
+    total <= 4
+      ? combos.map((_, i) => i)
+      : [0, 1, total - 1].filter((i, n, arr) => arr.indexOf(i) === n);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    const pos = caret.current;
+    if (!el || pos == null) return;
+    el.focus();
+    el.setSelectionRange(pos, pos);
+    caret.current = null;
+  }, [template]);
+
+  function insert(token) {
+    const el = inputRef.current;
+    const start = el?.selectionStart ?? template.length;
+    const end = el?.selectionEnd ?? template.length;
+    caret.current = start + token.length;
+    onChange(template.slice(0, start) + token + template.slice(end));
+  }
+
+  const chips = [
+    { token: "{i}", title: "组序号", hint: `1 … ${total}` },
+    { token: "{n}", title: "总组数", hint: String(total) },
+    ...dims.map((d) => ({
+      token: `{${d.dest}}`,
+      title: `该组 ${d.name}`,
+      hint: sampleValues(d.values),
+    })),
+  ];
+
+  return (
+    <div className="mt-2 rounded-lg border border-line bg-[#181511] p-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          ref={inputRef}
+          className="min-w-0 flex-1"
+          value={template}
+          placeholder="./runs/exp-{lr}-{i}"
+          onChange={(e) => onChange(e.target.value)}
+        />
+        <Button size="sm" title="改回普通参数" onClick={onCancel}>
+          取消
+        </Button>
+      </div>
+      <p className="mt-2 text-xs leading-relaxed text-muted">
+        这是模板，Kiln 按每一组的消融取值替换花括号。
+        {dims.length ? (
+          <>
+            {" "}
+            例如 <code className="text-text">{`{${dims[0].dest}}`}</code> 会变成这一组{" "}
+            <code className="text-text">{dims[0].name}</code> 实际填的值（{sampleValues(dims[0].values)}）。
+          </>
+        ) : (
+          <>
+            {" "}
+            先给 <code className="text-text">--lr</code>、<code className="text-text">--arch</code> 这类点「+
+            多值」，这里就会出现 <code className="text-text">{`{lr}`}</code>、
+            <code className="text-text">{`{arch}`}</code>，点一下插进路径。
+          </>
+        )}
+      </p>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {chips.map((chip) => (
+          <button
+            key={chip.token}
+            type="button"
+            className="rounded-md border border-line bg-panel px-2 py-1 text-left hover:border-ember/40"
+            title={`插入 ${chip.token}：${chip.title}`}
+            onClick={() => insert(chip.token)}
+          >
+            <span className="block font-mono text-[12px] text-text">{chip.token}</span>
+            <span className="block text-[10px] text-muted">
+              {chip.title} · {chip.hint}
+            </span>
+          </button>
+        ))}
+      </div>
+      <div className="mt-2.5 border-t border-line pt-2">
+        <div className="mb-1 text-[11px] text-muted">
+          {total > 1 ? `展开预览 · 共 ${total} 组` : "展开预览 · 现在只有 1 组，加上「+ 多值」之后会变成多行"}
+        </div>
+        {!hasPlaceholder && total > 1 ? (
+          <p className="mb-1.5 text-[11px] text-warn">模板里还没有花括号，{total} 组会写成同一个路径。</p>
+        ) : null}
+        <div className="space-y-1">
+          {previewIdx.map((i, n) => (
+            <div key={i}>
+              {n === previewIdx.length - 1 && previewIdx[n - 1] !== i - 1 && total > 4 ? (
+                <div className="mb-1 text-[11px] text-muted">…</div>
+              ) : null}
+              <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 font-mono text-[11px]">
+                <span className="shrink-0 text-muted">
+                  {i + 1}/{total}
+                </span>
+                <span className="min-w-0 break-all text-text">
+                  {renderTemplate(template, combos[i] || {}, i + 1, total)}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ArgRow({ arg, vals, tweaked, perRun, plan, onChange, onSweep, onPerRun }) {
   const req = arg.required;
   const boolLike = arg.type === "bool" || arg.action === "store_true" || arg.action === "store_false";
-  const singleChoice = arg.choices && arg.choices.length && vals.length <= 1;
+  const singleChoice = !perRun && arg.choices && arg.choices.length && vals.length <= 1;
+  const dims = plan?.dims || [];
+  const total = plan?.count || 1;
+  const collides = !perRun && total > 1 && vals.length === 1 && looksLikeArtifact(arg);
+
+  if (perRun) {
+    return (
+      <div className="min-w-0 border-b border-line py-3 last:border-b-0">
+        <ArgHead arg={arg} req={req} badge="每组唯一" />
+        {arg.help ? <div className="mt-1 min-w-0 text-xs break-all text-muted">{arg.help}</div> : null}
+        <PerRunEditor
+          template={String(vals[0] ?? "")}
+          plan={plan}
+          onChange={(next) => onPerRun(true, next)}
+          onCancel={() => onPerRun(false)}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="min-w-0 border-b border-line py-3 last:border-b-0">
-      <div className="flex min-w-0 items-baseline justify-between gap-3">
-        <span className="min-w-0 font-mono text-[13px] break-all">
-          {arg.name} {req ? <span className="text-bad">*</span> : null}
-        </span>
-        <span className="min-w-0 max-w-[45%] text-right text-xs break-all text-muted">
-          {arg.type || ""}
-          {arg.nargs ? ` · nargs=${arg.nargs}` : ""}
-          {arg.default !== undefined && arg.default !== null ? ` · 默认 ${formatDefault(arg)}` : ""}
-        </span>
-      </div>
+      <ArgHead arg={arg} req={req} badge={vals.length > 1 ? `网格 ×${vals.length}` : ""} />
       {arg.help ? <div className="mt-1 min-w-0 text-xs break-all text-muted">{arg.help}</div> : null}
       {isNargsList(arg) ? (
         <div className="mt-1 text-xs text-muted">空格分隔多个值，对应 --flag 1 2 3 4；逗号也会当成分隔符。点「+ 多值」才是消融成多条任务。</div>
@@ -707,6 +1031,18 @@ function ArgRow({ arg, vals, tweaked, onChange, onSweep }) {
       {tweaked ? (
         <div className="mt-1 min-w-0 text-xs break-all text-muted">
           本机没有 CUDA，已从默认 {String(arg.default)} 改为 {String(vals[0])}
+        </div>
+      ) : null}
+      {collides ? (
+        <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-lg border border-warn/35 bg-warn-soft/40 px-2 py-1.5 text-xs text-warn">
+          <span className="min-w-0">这看着像产物路径，{total} 组会全写到同一个地方。</span>
+          <button
+            type="button"
+            className="rounded-md border border-warn/40 px-1.5 py-0.5 text-[11px] hover:bg-warn/15"
+            onClick={() => onPerRun(true, suggestTemplate(vals[0], dims))}
+          >
+            设为每组唯一
+          </button>
         </div>
       ) : null}
       <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -763,12 +1099,47 @@ function ArgRow({ arg, vals, tweaked, onChange, onSweep }) {
                 </span>
               ))}
             </div>
-            <Button size="sm" title="添加一组值，生成消融任务" onClick={onSweep}>
+            <Button size="sm" title="添加一组值，参与笛卡尔积" onClick={onSweep}>
               + 多值
             </Button>
+            {vals.length === 1 && !isNargsList(arg) && templatable(arg) ? (
+              <Button
+                size="sm"
+                title="不参与相乘：写成模板，每组展开成不同的值"
+                onClick={() => onPerRun(true, suggestTemplate(vals[0], dims))}
+              >
+                每组唯一
+              </Button>
+            ) : null}
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+function ArgHead({ arg, req, badge }) {
+  return (
+    <div className="flex min-w-0 items-baseline justify-between gap-3">
+      <span className="flex min-w-0 items-baseline gap-1.5">
+        <span className="min-w-0 font-mono text-[13px] break-all">
+          {arg.name} {req ? <span className="text-bad">*</span> : null}
+        </span>
+        {badge ? (
+          <span
+            className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] ${
+              badge === "每组唯一" ? "bg-ember-soft text-ember" : "bg-hover text-muted"
+            }`}
+          >
+            {badge}
+          </span>
+        ) : null}
+      </span>
+      <span className="min-w-0 max-w-[45%] text-right text-xs break-all text-muted">
+        {arg.type || ""}
+        {arg.nargs ? ` · nargs=${arg.nargs}` : ""}
+        {arg.default !== undefined && arg.default !== null ? ` · 默认 ${formatDefault(arg)}` : ""}
+      </span>
     </div>
   );
 }
@@ -868,38 +1239,54 @@ function GpuPick({ gpu, selected, onChange }) {
       </div>
     );
   }
+  const ids = gpus.map((g) => String(g.index));
+  const picked = (selected || []).filter((id) => ids.includes(id));
   return (
-    <div className="my-2 flex flex-col gap-1.5">
-      {gpus.map((g) => {
-        const id = String(g.index);
-        const on = (selected || []).includes(id);
-        const run = (g.running || [])[0];
-        return (
-          <label
-            key={id}
-            className={`grid cursor-pointer grid-cols-[auto_1fr] items-start gap-2 rounded-lg border px-2.5 py-2 text-[13px] ${
-              on ? "border-ember/40 bg-ember-soft" : "border-line bg-[#181511]"
-            }`}
-          >
-            <input
-              type="checkbox"
-              className="mt-0.5 w-auto"
-              checked={on}
-              onChange={(e) => {
-                if (e.target.checked) onChange([...new Set([...(selected || []), id])]);
-                else onChange((selected || []).filter((x) => x !== id));
-              }}
-            />
-            <span>
-              <b>{id}</b> {g.name}
-              <span className="text-muted">
-                {" "}
-                {run ? `占用 ${run.script}` : "空闲"} · {Math.round(g.memory_used)}/{Math.round(g.memory_total)}G
+    <>
+      <div className="mt-2 mb-1 flex items-center gap-2 text-xs text-muted">
+        <span>
+          已选 {picked.length} / {gpus.length}
+        </span>
+        <button type="button" className="ml-auto hover:text-text" onClick={() => onChange(ids)}>
+          全选
+        </button>
+        <span className="text-line">|</span>
+        <button type="button" className="hover:text-text" onClick={() => onChange([])}>
+          清空
+        </button>
+      </div>
+      <div className="mb-2 grid gap-1 @[560px]:grid-cols-2 @[780px]:grid-cols-1">
+        {gpus.map((g) => {
+          const id = String(g.index);
+          const on = (selected || []).includes(id);
+          const run = (g.running || [])[0];
+          return (
+            <label
+              key={id}
+              className={`grid cursor-pointer grid-cols-[auto_1fr] items-start gap-2 rounded-lg border px-2.5 py-1.5 text-[13px] ${
+                on ? "border-ember/40 bg-ember-soft" : "border-line bg-[#181511]"
+              }`}
+            >
+              <input
+                type="checkbox"
+                className="mt-0.5 w-auto"
+                checked={on}
+                onChange={(e) => {
+                  if (e.target.checked) onChange([...new Set([...(selected || []), id])]);
+                  else onChange((selected || []).filter((x) => x !== id));
+                }}
+              />
+              <span className="min-w-0">
+                <b>{id}</b> <span className="break-all">{g.name}</span>
+                <span className="text-muted">
+                  {" "}
+                  {run ? `占用 ${run.script}` : "空闲"} · {Math.round(g.memory_used)}/{Math.round(g.memory_total)}G
+                </span>
               </span>
-            </span>
-          </label>
-        );
-      })}
-    </div>
+            </label>
+          );
+        })}
+      </div>
+    </>
   );
 }

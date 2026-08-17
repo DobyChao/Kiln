@@ -65,6 +65,7 @@ class LaunchIn(BaseModel):
     python: str | None = None
     cwd: str | None = None
     sweep: bool = False
+    per_run: list[str] = Field(default_factory=list)
 
 
 class ParseCliIn(BaseModel):
@@ -316,6 +317,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 gpu=body.gpu,
                 gpu_policy=body.gpu_policy,
                 sweep=body.sweep,
+                per_run=body.per_run,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -349,6 +351,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 python=body.python,
                 cwd=body.cwd,
                 sweep=body.sweep,
+                per_run=body.per_run,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc

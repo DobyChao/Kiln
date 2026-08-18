@@ -52,6 +52,11 @@ class PresetIn(BaseModel):
     payload: dict[str, Any]
 
 
+class PresetPatch(BaseModel):
+    name: str | None = None
+    payload: dict[str, Any] | None = None
+
+
 class LaunchIn(BaseModel):
     workspace_id: int
     script: str
@@ -291,6 +296,17 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     @app.post("/api/presets")
     def api_add_preset(body: PresetIn) -> dict[str, Any]:
         return store.add_preset(body.workspace_id, body.script, body.name, body.payload)
+
+    @app.patch("/api/presets/{preset_id}")
+    def api_update_preset(preset_id: int, body: PresetPatch) -> dict[str, Any]:
+        if body.name is None and body.payload is None:
+            raise HTTPException(400, "没有要更新的内容")
+        if body.name is not None and not body.name.strip():
+            raise HTTPException(400, "预设名称不能为空")
+        row = store.update_preset(preset_id, name=body.name, payload=body.payload)
+        if not row:
+            raise HTTPException(404, "预设不存在")
+        return row
 
     @app.delete("/api/presets/{preset_id}")
     def api_delete_preset(preset_id: int) -> dict[str, Any]:

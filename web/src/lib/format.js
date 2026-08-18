@@ -33,6 +33,29 @@ export function rememberWorkspace(id, name) {
   if (name) sessionStorage.setItem("kiln-ws-name", name);
 }
 
+export function launchDraftKey(wsId, script) {
+  return `kiln-launch:${wsId}:${script}`;
+}
+
+export function readLaunchDraft(wsId, script) {
+  try {
+    const raw = localStorage.getItem(launchDraftKey(wsId, script));
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    return data && typeof data === "object" ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeLaunchDraft(wsId, script, draft) {
+  try {
+    localStorage.setItem(launchDraftKey(wsId, script), JSON.stringify(draft));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
 export function readWorkspaceNav() {
   const id = sessionStorage.getItem("kiln-ws-id");
   const name = sessionStorage.getItem("kiln-ws-name") || "当前项目";

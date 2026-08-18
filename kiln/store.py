@@ -252,6 +252,29 @@ class Store:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM presets WHERE id = ?", (preset_id,))
 
+    def update_preset(
+        self,
+        preset_id: int,
+        *,
+        name: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM presets WHERE id = ?", (preset_id,)).fetchone()
+            if not row:
+                return None
+            if name is not None:
+                conn.execute("UPDATE presets SET name = ? WHERE id = ?", (name.strip(), preset_id))
+            if payload is not None:
+                conn.execute(
+                    "UPDATE presets SET payload = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False), preset_id),
+                )
+            row = conn.execute("SELECT * FROM presets WHERE id = ?", (preset_id,)).fetchone()
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            return item
+
     def add_job(self, job: dict[str, Any]) -> dict[str, Any]:
         payload = job.get("payload")
         if isinstance(payload, dict):

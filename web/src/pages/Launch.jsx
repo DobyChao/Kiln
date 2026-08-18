@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useKiln } from "../context/KilnContext";
-import { adapterLabel, hasCuda, rememberWorkspace } from "../lib/format";
-import { Button, CommitNumber, Empty, Field, Hint, PageHeader, Panel, Toggle } from "../components/ui";
+import { adapterLabel, hasCuda, readLaunchDraft, rememberWorkspace, writeLaunchDraft } from "../lib/format";
+import { Button, Empty, Field, Hint, PageHeader, Panel, Toggle } from "../components/ui";
 
 function isNargsList(arg) {
   const n = arg?.nargs;
@@ -207,12 +207,25 @@ function collectPayload(wsId, script, state, spec) {
   };
 }
 
+function formSnapshot(state) {
+  return JSON.stringify({
+    values: state.values,
+    extra: state.extra || "",
+    overrideRows: state.overrideRows || [],
+    envRows: state.envRows || [],
+    perRun: state.perRun || [],
+    gpus: state.gpus || [],
+    gpuPolicy: state.gpuPolicy || "pin",
+    python: state.python || "",
+    cwd: state.cwd || "",
+  });
+}
+
 export default function Launch() {
   const { wsId } = useParams();
   const [params] = useSearchParams();
   const script = params.get("script");
-  const navigate = useNavigate();
-  const { gpu, settings, setSettings, toast } = useKiln();
+  const { gpu, settings, setSettings, toast, refresh } = useKiln();
   const [error, setError] = useState("");
   const [cliText, setCliText] = useState("");
   const [ready, setReady] = useState(null);
@@ -238,29 +251,46 @@ export default function Launch() {
         if (cancelled) return;
         const ws = wsPack.workspace;
         rememberWorkspace(ws.id, ws.name);
+        const draft = readLaunchDraft(wsId, script);
         const values = {};
         const adjusted = [];
         const cudaNow = hasCuda(gpuInfo);
         for (const arg of spec.args || []) {
           const raw = defaultValue(arg);
+          const saved = draft?.values?.[arg.dest];
+          if (saved !== undefined && saved !== null) {
+            values[arg.dest] = Array.isArray(saved) ? saved : [saved];
+            continue;
+          }
           const next = preferLocalDevice(arg, raw, cudaNow);
           values[arg.dest] = [next];
           if (String(next) !== String(raw)) adjusted.push(arg.dest);
         }
+        const hydraBlank = spec.kind === "hydra" ? [{ key: "", vals: [""] }] : [];
+        const overrideRows =
+          Array.isArray(draft?.overrideRows) && draft.overrideRows.length ? draft.overrideRows : hydraBlank;
+        const envRows =
+          Array.isArray(draft?.envRows) && draft.envRows.length ? draft.envRows : [{ key: "", value: "" }];
+        const presetList = presets.presets || [];
+        const activeId = draft?.activePresetId;
+        const stillThere = presetList.some((p) => p.id === activeId);
         setReady({ spec, ws, interpreters: interpreters.interpreters || [] });
         setL({
           values,
-          extra: "",
-          overrideRows: spec.kind === "hydra" ? [{ key: "", vals: [""] }] : [],
-          envRows: [{ key: "", value: "" }],
-          perRun: [],
-          gpus: [],
-          gpuPolicy: "spread",
-          python: ws.python || "",
-          cwd: "",
-          presets: presets.presets || [],
-          adjusted,
+          extra: typeof draft?.extra === "string" ? draft.extra : "",
+          overrideRows,
+          envRows,
+          perRun: Array.isArray(draft?.perRun) ? draft.perRun.filter((dest) => dest in values) : [],
+          gpus: Array.isArray(draft?.gpus) ? draft.gpus : [],
+          gpuPolicy: draft?.gpuPolicy === "pin" ? "pin" : "spread",
+          python: draft?.python || ws.python || "",
+          cwd: typeof draft?.cwd === "string" ? draft.cwd : "",
+          presets: presetList,
+          activePresetId: stillThere ? activeId : null,
+          presetBaseline: stillThere ? draft?.presetBaseline || null : null,
+          adjusted: draft ? [] : adjusted,
         });
+        if (typeof draft?.cliText === "string") setCliText(draft.cliText);
       } catch (err) {
         if (!cancelled) setError(err.message);
       }
@@ -327,6 +357,30 @@ export default function Launch() {
     setL((prev) => (prev ? fn({ ...prev }) : prev));
   }
 
+  function persistDraft(state = L, cli = cliText) {
+    if (!state || !script) return;
+    writeLaunchDraft(wsId, script, {
+      values: state.values,
+      extra: state.extra,
+      overrideRows: state.overrideRows,
+      envRows: state.envRows,
+      perRun: state.perRun,
+      gpus: state.gpus,
+      gpuPolicy: state.gpuPolicy,
+      python: state.python,
+      cwd: state.cwd,
+      cliText: cli,
+      activePresetId: state.activePresetId || null,
+      presetBaseline: state.presetBaseline || null,
+    });
+  }
+
+  useEffect(() => {
+    if (!L) return undefined;
+    const t = setTimeout(() => persistDraft(L, cliText), 200);
+    return () => clearTimeout(t);
+  }, [L, cliText, wsId, script]);
+
   async function doLaunch() {
     const payload = collectPayload(wsId, script, L, ready.spec);
     const missing = (ready.spec.args || []).filter((arg) => {
@@ -344,30 +398,79 @@ export default function Launch() {
     }
     try {
       const data = await api("/jobs", { method: "POST", body: payload });
+      persistDraft();
       toast(`已提交 ${data.count} 个任务${data.max_concurrent ? ` · 同时 ${data.max_concurrent} 路` : ""}`);
-      navigate("/jobs");
+      refresh();
     } catch (err) {
       toast(err.message);
     }
   }
 
-  async function savePreset() {
-    const name = (L.presetName || "").trim();
-    if (!name) {
+  async function reloadPresets() {
+    const data = await api(`/presets?workspace_id=${wsId}&script=${encodeURIComponent(script)}`);
+    return data.presets || [];
+  }
+
+  async function createPreset(name) {
+    const trimmed = (name || "").trim();
+    if (!trimmed) {
       toast("先填一个预设名称");
       return;
     }
     const payload = collectPayload(wsId, script, L, ready.spec);
     try {
-      await api("/presets", {
+      const created = await api("/presets", {
         method: "POST",
-        body: { workspace_id: Number(wsId), script, name, payload },
+        body: { workspace_id: Number(wsId), script, name: trimmed, payload },
       });
-      toast("已保存预设");
-      const data = await api(`/presets?workspace_id=${wsId}&script=${encodeURIComponent(script)}`);
-      patch((prev) => ({ ...prev, presets: data.presets || [], presetName: "" }));
+      const list = await reloadPresets();
+      patch((prev) => {
+        const next = { ...prev, presets: list, presetName: "", activePresetId: created.id };
+        next.presetBaseline = formSnapshot(next);
+        return next;
+      });
+      toast(`已新建「${trimmed}」`);
     } catch (err) {
       toast(err.message);
+    }
+  }
+
+  async function overwritePreset() {
+    if (!L.activePresetId) {
+      toast("还没有当前预设，先新建或选一个");
+      return;
+    }
+    const payload = collectPayload(wsId, script, L, ready.spec);
+    try {
+      await api(`/presets/${L.activePresetId}`, { method: "PATCH", body: { payload } });
+      const list = await reloadPresets();
+      patch((prev) => {
+        const next = { ...prev, presets: list };
+        next.presetBaseline = formSnapshot(next);
+        return next;
+      });
+      const name = (L.presets.find((p) => p.id === L.activePresetId) || {}).name || "当前预设";
+      toast(`已覆盖「${name}」`);
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  async function renamePreset(id, name) {
+    const trimmed = (name || "").trim();
+    if (!trimmed) {
+      toast("名称不能为空");
+      return false;
+    }
+    try {
+      await api(`/presets/${id}`, { method: "PATCH", body: { name: trimmed } });
+      const list = await reloadPresets();
+      patch((prev) => ({ ...prev, presets: list }));
+      toast("已改名");
+      return true;
+    } catch (err) {
+      toast(err.message);
+      return false;
     }
   }
 
@@ -395,22 +498,27 @@ export default function Launch() {
     if (!overrideRows.length && ready.spec.kind === "hydra") overrideRows = [{ key: "", vals: [""] }];
     let envRows = Object.entries(p.env || {}).map(([key, value]) => ({ key, value }));
     if (!envRows.length) envRows = [{ key: "", value: "" }];
-    patch((prev) => ({
-      ...prev,
-      values,
-      perRun: (p.per_run || []).filter((dest) => dest in values),
-      extra: p.extra || "",
-      python: p.python || prev.python,
-      gpus: String(p.gpu || "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      gpuPolicy: p.gpu_policy || ((p.gpu || "").includes(",") ? "spread" : "pin"),
-      cwd: p.cwd || "",
-      overrideRows,
-      envRows,
-      adjusted: [],
-    }));
+    patch((prev) => {
+      const next = {
+        ...prev,
+        values,
+        perRun: (p.per_run || []).filter((dest) => dest in values),
+        extra: p.extra || "",
+        python: p.python || prev.python,
+        gpus: String(p.gpu || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        gpuPolicy: p.gpu_policy || ((p.gpu || "").includes(",") ? "spread" : "pin"),
+        cwd: p.cwd || "",
+        overrideRows,
+        envRows,
+        adjusted: [],
+        activePresetId: id,
+      };
+      next.presetBaseline = formSnapshot(next);
+      return next;
+    });
     toast(`已套用 ${preset.name}`);
   }
 
@@ -418,8 +526,13 @@ export default function Launch() {
     if (!confirm(`删除预设「${name}」？`)) return;
     try {
       await api(`/presets/${id}`, { method: "DELETE" });
-      const data = await api(`/presets?workspace_id=${wsId}&script=${encodeURIComponent(script)}`);
-      patch((prev) => ({ ...prev, presets: data.presets || [] }));
+      const list = await reloadPresets();
+      patch((prev) => ({
+        ...prev,
+        presets: list,
+        activePresetId: prev.activePresetId === id ? null : prev.activePresetId,
+        presetBaseline: prev.activePresetId === id ? null : prev.presetBaseline,
+      }));
       toast("已删除预设");
     } catch (err) {
       toast(err.message);
@@ -487,6 +600,7 @@ export default function Launch() {
   const args = spec.args || [];
   const plan = sweepPlan(spec, L);
   const perRunNames = (L.perRun || []).map((dest) => args.find((a) => a.dest === dest)?.name || dest);
+  const presetDirty = !!(L.activePresetId && L.presetBaseline && formSnapshot(L) !== L.presetBaseline);
 
   return (
     <div className="@container">
@@ -525,7 +639,7 @@ export default function Launch() {
           <li>
             脚本自己管卡时：界面上<strong className="font-medium text-text">不要选卡</strong>
             。Kiln 不会设置 <code>CUDA_VISIBLE_DEVICES</code>
-            ，脚本里的 <code>cuda:0</code> 按机器真实编号生效。多路一起跑时把「同时跑几路」压低，避免打满同一张卡。要让
+            ，脚本里的 <code>cuda:0</code> 按机器真实编号生效。多路一起跑时把侧栏「同时最多几路」压低，避免打满同一张卡。要让
             Kiln 排队、互斥，就把卡勾上，脚本里用相对可见设备（通常是 <code>cuda:0</code>）。
           </li>
         </ul>
@@ -739,22 +853,6 @@ export default function Launch() {
               </>
             )}
             <div className="mt-4 grid gap-2.5 @[560px]:grid-cols-2 @[780px]:grid-cols-1">
-              <Field label="同时跑几路">
-                <CommitNumber
-                  value={settings.max_concurrent}
-                  min={1}
-                  max={64}
-                  onCommit={async (n) => {
-                    try {
-                      const next = await api("/settings", { method: "POST", body: { max_concurrent: n } });
-                      setSettings(next);
-                    } catch (err) {
-                      toast(err.message);
-                      throw err;
-                    }
-                  }}
-                />
-              </Field>
               <Field label="Python">
                 <select value={L.python} onChange={(e) => patch((prev) => ({ ...prev, python: e.target.value }))}>
                   {pythonOptions.map((o) => (
@@ -772,7 +870,6 @@ export default function Launch() {
                 />
               </Field>
             </div>
-            {!cuda && <p className="mt-1.5 text-xs text-muted">没有 GPU 时建议 1–2 路，避免把 CPU 打满。</p>}
           </Panel>
         </div>
       </div>
@@ -781,10 +878,14 @@ export default function Launch() {
         <div className="flex flex-wrap items-center gap-2">
           <PresetMenu
             presets={L.presets}
+            activeId={L.activePresetId}
+            dirty={presetDirty}
             name={L.presetName || ""}
             onName={(presetName) => patch((prev) => ({ ...prev, presetName }))}
-            onSave={savePreset}
             onApply={applyPreset}
+            onCreate={() => createPreset(L.presetName)}
+            onOverwrite={overwritePreset}
+            onRename={renamePreset}
             onDelete={deletePreset}
           />
           {preview.hint && <span className="ml-auto hidden text-xs text-muted md:block">{preview.hint}</span>}
@@ -800,17 +901,27 @@ export default function Launch() {
   );
 }
 
-function PresetMenu({ presets, name, onName, onSave, onApply, onDelete }) {
+function PresetMenu({ presets, activeId, dirty, name, onName, onApply, onCreate, onOverwrite, onRename, onDelete }) {
   const [open, setOpen] = useState(false);
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameText, setRenameText] = useState("");
   const box = useRef(null);
+  const active = presets.find((p) => p.id === activeId);
+  const label = active ? `${active.name}${dirty ? "*" : ""}` : "预设";
 
   useEffect(() => {
-    if (!open) return undefined;
+    if (!open) {
+      setRenamingId(null);
+      return undefined;
+    }
     function onDown(e) {
       if (!box.current?.contains(e.target)) setOpen(false);
     }
     function onKey(e) {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        if (renamingId != null) setRenamingId(null);
+        else setOpen(false);
+      }
     }
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
@@ -818,57 +929,121 @@ function PresetMenu({ presets, name, onName, onSave, onApply, onDelete }) {
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open]);
+  }, [open, renamingId]);
+
+  async function commitRename(id) {
+    const ok = await onRename(id, renameText);
+    if (ok) setRenamingId(null);
+  }
 
   return (
     <div className="relative" ref={box}>
-      <Button onClick={() => setOpen((v) => !v)} aria-expanded={open} aria-haspopup="menu">
-        预设{presets.length ? ` · ${presets.length}` : ""}
+      <Button
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        title={active ? (dirty ? `${active.name}（有未保存的修改）` : active.name) : "预设"}
+      >
+        <span className="max-w-[9.5rem] truncate">{label}</span>
         <span className={`ml-1.5 text-[9px] text-muted transition-transform ${open ? "rotate-180" : ""}`}>▲</span>
       </Button>
       {open && (
-        <div className="absolute bottom-full left-0 z-30 mb-2 w-72 rounded-xl border border-[#4d453a] bg-hover p-2 shadow-[0_12px_32px_rgba(0,0,0,.6)]">
+        <div className="absolute bottom-full left-0 z-30 mb-2 w-80 rounded-xl border border-[#4d453a] bg-hover p-2 shadow-[0_12px_32px_rgba(0,0,0,.6)]">
           {presets.length ? (
             <div className="max-h-56 overflow-y-auto overscroll-contain">
-              {presets.map((p) => (
-                <div key={p.id} className="flex items-center gap-1 rounded-lg hover:bg-line/60">
-                  <button
-                    type="button"
-                    className="min-w-0 flex-1 truncate px-2 py-1.5 text-left text-sm"
-                    title={`套用 ${p.name}`}
-                    onClick={() => {
-                      onApply(p.id);
-                      setOpen(false);
-                    }}
+              {presets.map((p) => {
+                const on = p.id === activeId;
+                return (
+                  <div
+                    key={p.id}
+                    className={`flex items-center gap-1 rounded-lg ${on ? "bg-ember-soft" : "hover:bg-line/60"}`}
                   >
-                    {p.name}
-                  </button>
-                  <button
-                    type="button"
-                    className="shrink-0 rounded-md px-2 py-1 text-xs text-muted hover:bg-bad-soft hover:text-bad"
-                    title={`删除 ${p.name}`}
-                    onClick={() => onDelete(p.id, p.name)}
-                  >
-                    删除
-                  </button>
-                </div>
-              ))}
+                    {renamingId === p.id ? (
+                      <input
+                        className="min-w-0 flex-1 py-1"
+                        value={renameText}
+                        autoFocus
+                        onChange={(e) => setRenameText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            commitRename(p.id);
+                          }
+                        }}
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 truncate px-2 py-1.5 text-left text-sm"
+                        title={`套用 ${p.name}`}
+                        onClick={() => {
+                          onApply(p.id);
+                          setOpen(false);
+                        }}
+                      >
+                        {p.name}
+                        {on && dirty ? <span className="text-ember">*</span> : null}
+                      </button>
+                    )}
+                    {renamingId === p.id ? (
+                      <button
+                        type="button"
+                        className="shrink-0 rounded-md px-2 py-1 text-xs hover:bg-panel"
+                        onClick={() => commitRename(p.id)}
+                      >
+                        确定
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="shrink-0 rounded-md px-2 py-1 text-xs text-muted hover:bg-panel hover:text-text"
+                        title={`更名 ${p.name}`}
+                        onClick={() => {
+                          setRenamingId(p.id);
+                          setRenameText(p.name);
+                        }}
+                      >
+                        更名
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="shrink-0 rounded-md px-2 py-1 text-xs text-muted hover:bg-bad-soft hover:text-bad"
+                      title={`删除 ${p.name}`}
+                      onClick={() => onDelete(p.id, p.name)}
+                    >
+                      删除
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           ) : (
-            <p className="px-2 py-2 text-xs text-muted">还没有预设。给当前这套参数起个名字存下来，下次一键套用。</p>
+            <p className="px-2 py-2 text-xs text-muted">还没有预设。给当前这套参数起个名字新建一份。</p>
           )}
-          <div className="mt-1.5 flex gap-1.5 border-t border-line pt-2">
-            <input
-              className="min-w-0 flex-1"
-              placeholder="预设名称"
-              value={name}
-              onChange={(e) => onName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") onSave();
-              }}
-            />
-            <Button size="sm" onClick={onSave}>
-              保存当前
+          <div className="mt-1.5 space-y-1.5 border-t border-line pt-2">
+            <div className="flex gap-1.5">
+              <input
+                className="min-w-0 flex-1"
+                placeholder="新预设名称"
+                value={name}
+                onChange={(e) => onName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") onCreate();
+                }}
+              />
+              <Button size="sm" onClick={onCreate}>
+                新建
+              </Button>
+            </div>
+            <Button
+              size="sm"
+              className="w-full"
+              disabled={!active}
+              title={active ? `把当前表单写入「${active.name}」` : "先选一个预设"}
+              onClick={onOverwrite}
+            >
+              {active ? `覆盖「${active.name}」` : "覆盖当前预设"}
             </Button>
           </div>
         </div>
@@ -1048,8 +1223,42 @@ function ArgRow({ arg, vals, tweaked, perRun, plan, onChange, onSweep, onPerRun 
       <div className="mt-2 flex flex-wrap items-center gap-2">
         {boolLike ? (
           <>
-            <Toggle on={isTruthy(vals[0])} onClick={() => onChange([!isTruthy(vals[0])])} />
-            <span className="text-xs text-muted">{isTruthy(vals[0]) ? "true" : "false"}</span>
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+              {vals.map((v, i) => (
+                <span key={i} className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-hover px-2 py-1">
+                  <Toggle
+                    on={isTruthy(v)}
+                    onClick={() => {
+                      const next = [...vals];
+                      next[i] = !isTruthy(v);
+                      onChange(next);
+                    }}
+                  />
+                  <span className="text-xs text-muted">{isTruthy(v) ? "true" : "false"}</span>
+                  {vals.length > 1 && (
+                    <button
+                      type="button"
+                      className="px-1 text-muted"
+                      onClick={() => {
+                        const next = vals.filter((_, idx) => idx !== i);
+                        onChange(next.length ? next : [false]);
+                      }}
+                    >
+                      ×
+                    </button>
+                  )}
+                </span>
+              ))}
+            </div>
+            {!(vals.some(isTruthy) && vals.some((v) => !isTruthy(v))) ? (
+              <Button
+                size="sm"
+                title="再加 true 或 false，生成消融任务"
+                onClick={() => onChange([...vals, !isTruthy(vals[0])])}
+              >
+                + 多值
+              </Button>
+            ) : null}
           </>
         ) : singleChoice ? (
           <>
@@ -1217,7 +1426,7 @@ function GpuPick({ gpu, selected, onChange }) {
     return (
       <div className="my-2 text-sm text-muted">
         <p>
-          这台机器没有 NVIDIA GPU{name ? `（${name}）` : ""}。任务会按「同时跑几路」做普通进程并发。在 Linux
+          这台机器没有 NVIDIA GPU{name ? `（${name}）` : ""}。任务会按侧栏「同时最多几路」做普通进程并发。在 Linux
           训练机上启动 Kiln 时，这里会列出 CUDA 卡。
         </p>
         <details className="mt-2">

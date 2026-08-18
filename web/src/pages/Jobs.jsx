@@ -3,7 +3,7 @@ import { api } from "../api";
 import { useKiln } from "../context/KilnContext";
 import { adapterLabel, elapsed, hasCuda } from "../lib/format";
 import { lastLines, renderTerminal } from "../lib/term";
-import { Button, CommitNumber, Field, Hint, PageHeader, Panel, StatusBadge } from "../components/ui";
+import { Button, Hint, PageHeader, Panel, StatusBadge } from "../components/ui";
 
 export default function Jobs() {
   const { gpu, jobs, settings, setSettings, toast, refresh } = useKiln();
@@ -71,26 +71,6 @@ export default function Jobs() {
                 同卡不叠
               </label>
             )}
-            <Field label="同时运行" className="w-[140px]">
-              <CommitNumber
-                value={settings.max_concurrent}
-                min={1}
-                max={64}
-                onCommit={async (n) => {
-                  try {
-                    const next = await api("/settings", {
-                      method: "POST",
-                      body: { max_concurrent: n },
-                    });
-                    setSettings(next);
-                    toast("并发已更新");
-                  } catch (err) {
-                    toast(err.message);
-                    throw err;
-                  }
-                }}
-              />
-            </Field>
             <Button
               size="sm"
               onClick={async () => {

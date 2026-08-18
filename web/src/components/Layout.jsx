@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+import { api } from "../api";
 import { useKiln } from "../context/KilnContext";
 import { adapterLabel, readWorkspaceNav } from "../lib/format";
+import { CommitNumber, Field } from "./ui";
 
 const SIDEBAR_KEY = "kiln-sidebar-w";
 const SIDEBAR_DEFAULT = 240;
@@ -65,7 +67,7 @@ function GpuStrip({ gpu, jobs }) {
 }
 
 function Sidebar({ onNavigate }) {
-  const { gpu, jobs } = useKiln();
+  const { gpu, jobs, settings, setSettings, toast } = useKiln();
   const location = useLocation();
   const [wsNav, setWsNav] = useState(readWorkspaceNav);
   const running = jobs.filter((j) => j.status === "running" || j.status === "queued").length;
@@ -75,7 +77,7 @@ function Sidebar({ onNavigate }) {
   }, [location]);
 
   const linkClass = ({ isActive }) =>
-    `rounded-lg px-2.5 py-2 text-sm no-underline transition ${
+    `flex items-center rounded-lg px-2.5 py-2 text-sm no-underline transition ${
       isActive ? "bg-hover font-semibold text-text" : "text-text hover:bg-hover"
     }`;
 
@@ -103,7 +105,14 @@ function Sidebar({ onNavigate }) {
           </NavLink>
         )}
         <NavLink to="/jobs" className={linkClass} onClick={onNavigate}>
-          任务
+          <span className="flex w-full items-center justify-between gap-2">
+            任务
+            {running > 0 ? (
+              <span className="rounded-full bg-ember-soft px-1.5 py-0.5 text-[11px] font-semibold text-ember">
+                {running}
+              </span>
+            ) : null}
+          </span>
         </NavLink>
       </nav>
       <div className="mt-4 rounded-lg bg-panel/60 px-3 py-2.5 text-xs leading-relaxed text-muted">
@@ -115,8 +124,26 @@ function Sidebar({ onNavigate }) {
           3. 运行后在「任务」看日志
         </p>
       </div>
-      <div className="mt-auto flex flex-col gap-2 pt-4">
-        {running > 0 && <div className="px-2.5 text-xs text-ember">{running} 个任务进行中</div>}
+      <div className="mt-3 shrink-0">
+        <Field label="同时最多几路">
+          <CommitNumber
+            value={settings.max_concurrent}
+            min={1}
+            max={64}
+            onCommit={async (n) => {
+              try {
+                const next = await api("/settings", { method: "POST", body: { max_concurrent: n } });
+                setSettings(next);
+              } catch (err) {
+                toast(err.message);
+                throw err;
+              }
+            }}
+          />
+        </Field>
+        <p className="mt-1 text-[10px] leading-snug text-muted">Kiln 全局上限，所有脚本共用。没选卡的任务只受这一条约束。</p>
+      </div>
+      <div className="mt-auto min-h-0 flex-1 overflow-y-auto overscroll-contain pt-3">
         <GpuStrip gpu={gpu} jobs={jobs} />
       </div>
     </div>
@@ -164,10 +191,10 @@ export default function Layout() {
   return (
     <div className={`flex h-dvh overflow-hidden bg-bg text-text ${resizing ? "select-none" : ""}`}>
       <div
-        className="relative hidden shrink-0 md:flex"
+        className="relative hidden min-h-0 shrink-0 md:flex"
         style={{ width: sidebarW }}
       >
-        <aside className="flex h-full min-h-0 w-full flex-col overflow-y-auto border-r border-line bg-sidebar px-3 py-4">
+        <aside className="flex h-full min-h-0 w-full flex-col overflow-hidden border-r border-line bg-sidebar px-3 py-4">
           <Sidebar />
         </aside>
         <div
@@ -206,7 +233,7 @@ export default function Layout() {
             aria-label="关闭菜单"
             onClick={() => setOpen(false)}
           />
-          <aside className="relative z-10 h-full w-64 overflow-y-auto border-r border-line bg-sidebar px-3 py-4">
+          <aside className="relative z-10 flex h-full w-64 min-h-0 flex-col overflow-hidden border-r border-line bg-sidebar px-3 py-4">
             <Sidebar onNavigate={() => setOpen(false)} />
           </aside>
         </div>

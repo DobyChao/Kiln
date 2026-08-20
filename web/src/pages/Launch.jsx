@@ -26,10 +26,29 @@ function parseNargsInput(arg, raw) {
     .map((s) => coerceArg(arg, s));
 }
 
+/** True when Number(s) would accept the text but collapsing to a number would fight typing. */
+function isNumericDraft(raw) {
+  const s = String(raw ?? "");
+  const t = s.trim();
+  if (!t || t === "+" || t === "-" || t === "." || t === "+." || t === "-.") return true;
+  // "1." / "1.0" / "1e-" — Number() parses these but String(Number()) loses the draft.
+  if (/[eE][+-]?$/.test(t)) return true;
+  if (/^[+-]?\d+\.$/.test(t)) return true;
+  const n = Number(t);
+  if (Number.isNaN(n)) return true;
+  return String(n) !== t;
+}
+
 function coerceArg(arg, raw) {
   if (!arg) return raw;
-  if (arg.type === "int" && raw !== "" && !Number.isNaN(Number(raw))) return Number(raw);
-  if (arg.type === "float" && raw !== "" && !Number.isNaN(Number(raw))) return Number(raw);
+  if (arg.type === "int" || arg.type === "float") {
+    if (raw === "" || raw == null) return raw;
+    if (typeof raw === "number") return raw;
+    if (isNumericDraft(raw)) return typeof raw === "string" ? raw : String(raw);
+    const n = Number(String(raw).trim());
+    if (arg.type === "int" && !Number.isInteger(n)) return String(raw);
+    return n;
+  }
   if (arg.type === "bool") return isTruthy(raw);
   return raw;
 }

@@ -173,6 +173,30 @@ function preferLocalDevice(arg, value, cuda) {
   return cpu !== undefined ? cpu : "cpu";
 }
 
+/** Pinned dests first (stable pin order), then the rest in catalog order. */
+function partitionArgs(args, pinned) {
+  const byDest = Object.fromEntries((args || []).map((a) => [a.dest, a]));
+  const pinSet = new Set(pinned || []);
+  const top = (pinned || []).map((d) => byDest[d]).filter(Boolean);
+  const rest = (args || []).filter((a) => !pinSet.has(a.dest));
+  return { top, rest };
+}
+
+function formatArgSummary(arg, vals) {
+  const boolLike = arg.type === "bool" || arg.action === "store_true" || arg.action === "store_false";
+  if (boolLike) {
+    if ((vals || []).length > 1) return vals.map((v) => (isTruthy(v) ? "true" : "false")).join(" | ");
+    return isTruthy(vals?.[0]) ? "true" : "false";
+  }
+  if (isNargsList(arg)) {
+    const text = formatNargs(vals?.[0]);
+    return text || "—";
+  }
+  const clean = (vals || []).filter((v) => v !== "" && v !== null && v !== undefined);
+  if (!clean.length) return "—";
+  return clean.map((v) => (Array.isArray(v) ? formatNargs(v) : String(v))).join(" | ");
+}
+
 function isTruthy(v) {
   return v === true || v === "true" || v === "1" || v === 1;
 }
@@ -300,6 +324,9 @@ export default function Launch() {
           overrideRows,
           envRows,
           perRun: Array.isArray(draft?.perRun) ? draft.perRun.filter((dest) => dest in values) : [],
+          pinned: Array.isArray(draft?.pinned) ? draft.pinned.filter((dest) => dest in values) : [],
+          folded: Array.isArray(draft?.folded) ? draft.folded.filter((dest) => dest in values) : [],
+          foldRest: !!draft?.foldRest,
           gpus: Array.isArray(draft?.gpus) ? draft.gpus : [],
           gpuPolicy: draft?.gpuPolicy === "pin" ? "pin" : "spread",
           python: draft?.python || ws.python || "",
@@ -384,6 +411,9 @@ export default function Launch() {
       overrideRows: state.overrideRows,
       envRows: state.envRows,
       perRun: state.perRun,
+      pinned: state.pinned || [],
+      folded: state.folded || [],
+      foldRest: !!state.foldRest,
       gpus: state.gpus,
       gpuPolicy: state.gpuPolicy,
       python: state.python,
@@ -620,6 +650,73 @@ export default function Launch() {
   const plan = sweepPlan(spec, L);
   const perRunNames = (L.perRun || []).map((dest) => args.find((a) => a.dest === dest)?.name || dest);
   const presetDirty = !!(L.activePresetId && L.presetBaseline && formSnapshot(L) !== L.presetBaseline);
+  const pinned = L.pinned || [];
+  const folded = L.folded || [];
+  const { top: pinnedArgs, rest: otherArgs } = partitionArgs(args, pinned);
+  const restCollapsed = !!L.foldRest && pinnedArgs.length > 0 && otherArgs.length > 0;
+
+  function renderArgRow(arg) {
+    return (
+      <ArgRow
+        key={arg.dest}
+        arg={arg}
+        vals={L.values[arg.dest] ?? [defaultValue(arg)]}
+        tweaked={(L.adjusted || []).includes(arg.dest)}
+        perRun={(L.perRun || []).includes(arg.dest)}
+        pinned={pinned.includes(arg.dest)}
+        folded={folded.includes(arg.dest)}
+        plan={plan}
+        onPin={() =>
+          patch((prev) => {
+            const cur = prev.pinned || [];
+            const on = cur.includes(arg.dest);
+            const next = on ? cur.filter((d) => d !== arg.dest) : [...cur, arg.dest];
+            let foldRest = !!prev.foldRest;
+            if (!on && next.length === 1) foldRest = true;
+            if (on && next.length === 0) foldRest = false;
+            return { ...prev, pinned: next, foldRest };
+          })
+        }
+        onFold={() =>
+          patch((prev) => {
+            const cur = prev.folded || [];
+            const on = cur.includes(arg.dest);
+            return { ...prev, folded: on ? cur.filter((d) => d !== arg.dest) : [...cur, arg.dest] };
+          })
+        }
+        onChange={(vals) =>
+          patch((prev) => ({
+            ...prev,
+            values: {
+              ...prev.values,
+              [arg.dest]: vals.map((v) => (typeof v === "number" || typeof v === "boolean" ? v : coerce(arg.dest, v))),
+            },
+          }))
+        }
+        onSweep={() =>
+          patch((prev) => {
+            const cur = prev.values[arg.dest] || [""];
+            return {
+              ...prev,
+              values: { ...prev.values, [arg.dest]: [...cur, defaultValue(arg)] },
+            };
+          })
+        }
+        onPerRun={(on, template) =>
+          patch((prev) => {
+            const rest = (prev.perRun || []).filter((d) => d !== arg.dest);
+            const cur = prev.values[arg.dest] || [""];
+            const next = template === undefined ? [cur[0] ?? ""] : [template];
+            return {
+              ...prev,
+              perRun: on ? [...rest, arg.dest] : rest,
+              values: { ...prev.values, [arg.dest]: on ? next : cur },
+            };
+          })
+        }
+      />
+    );
+  }
 
   return (
     <div className="@container">
@@ -680,60 +777,66 @@ export default function Launch() {
           <Panel>
             <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
               <h2 className="text-[15px] font-semibold">参数</h2>
-              {plan.dims.length ? (
-                <span className="text-xs text-muted">
-                  笛卡尔积 <b className="text-text">{plan.count}</b> 组 ={" "}
-                  <span className="font-mono">{plan.dims.map((d) => `${d.name}×${d.count}`).join(" × ")}</span>
-                  {perRunNames.length ? (
-                    <>
-                      {" · "}每组唯一：<span className="font-mono text-ember">{perRunNames.join(" ")}</span>
-                    </>
-                  ) : null}
-                </span>
-              ) : null}
+              <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+                {pinnedArgs.length > 0 && otherArgs.length > 0 ? (
+                  <Button
+                    size="sm"
+                    title={restCollapsed ? "展开未置顶的参数" : "只留下置顶参数，其余收起"}
+                    onClick={() => patch((prev) => ({ ...prev, foldRest: !prev.foldRest }))}
+                  >
+                    {restCollapsed ? `展开其余 ${otherArgs.length}` : `折叠其余 ${otherArgs.length}`}
+                  </Button>
+                ) : null}
+                {plan.dims.length ? (
+                  <span className="text-xs text-muted">
+                    笛卡尔积 <b className="text-text">{plan.count}</b> 组 ={" "}
+                    <span className="font-mono">{plan.dims.map((d) => `${d.name}×${d.count}`).join(" × ")}</span>
+                    {perRunNames.length ? (
+                      <>
+                        {" · "}每组唯一：<span className="font-mono text-ember">{perRunNames.join(" ")}</span>
+                      </>
+                    ) : null}
+                  </span>
+                ) : null}
+              </div>
             </div>
             {args.length ? (
               <div>
-                {args.map((arg) => (
-                  <ArgRow
-                    key={arg.dest}
-                    arg={arg}
-                    vals={L.values[arg.dest] ?? [defaultValue(arg)]}
-                    tweaked={(L.adjusted || []).includes(arg.dest)}
-                    perRun={(L.perRun || []).includes(arg.dest)}
-                    plan={plan}
-                    onChange={(vals) =>
-                      patch((prev) => ({
-                        ...prev,
-                        values: {
-                          ...prev.values,
-                          [arg.dest]: vals.map((v) => (typeof v === "number" || typeof v === "boolean" ? v : coerce(arg.dest, v))),
-                        },
-                      }))
-                    }
-                    onSweep={() =>
-                      patch((prev) => {
-                        const cur = prev.values[arg.dest] || [""];
-                        return {
-                          ...prev,
-                          values: { ...prev.values, [arg.dest]: [...cur, defaultValue(arg)] },
-                        };
-                      })
-                    }
-                    onPerRun={(on, template) =>
-                      patch((prev) => {
-                        const rest = (prev.perRun || []).filter((d) => d !== arg.dest);
-                        const cur = prev.values[arg.dest] || [""];
-                        const next = template === undefined ? [cur[0] ?? ""] : [template];
-                        return {
-                          ...prev,
-                          perRun: on ? [...rest, arg.dest] : rest,
-                          values: { ...prev.values, [arg.dest]: on ? next : cur },
-                        };
-                      })
-                    }
-                  />
-                ))}
+                {pinnedArgs.length > 0 ? (
+                  <div>
+                    {pinnedArgs.length > 0 && otherArgs.length > 0 ? (
+                      <div className="mb-1 text-[11px] tracking-wide text-muted uppercase">置顶</div>
+                    ) : null}
+                    {pinnedArgs.map(renderArgRow)}
+                  </div>
+                ) : null}
+                {otherArgs.length > 0 ? (
+                  restCollapsed ? (
+                    <button
+                      type="button"
+                      className="mt-2 flex w-full flex-col gap-1 rounded-lg border border-dashed border-line bg-hover/40 px-3 py-2.5 text-left text-xs text-muted hover:border-ember/35 hover:text-text"
+                      onClick={() => patch((prev) => ({ ...prev, foldRest: false }))}
+                    >
+                      <span>
+                        其余 <b className="text-text">{otherArgs.length}</b> 个参数已折叠 · 点击展开
+                      </span>
+                      <span className="min-w-0 font-mono break-all opacity-80">
+                        {otherArgs
+                          .slice(0, 8)
+                          .map((a) => a.name)
+                          .join("  ")}
+                        {otherArgs.length > 8 ? "  …" : ""}
+                      </span>
+                    </button>
+                  ) : (
+                    <div>
+                      {pinnedArgs.length > 0 ? (
+                        <div className="mt-3 mb-1 text-[11px] tracking-wide text-muted uppercase">其余</div>
+                      ) : null}
+                      {otherArgs.map(renderArgRow)}
+                    </div>
+                  )
+                ) : null}
               </div>
             ) : (
               <p className="text-sm text-muted">没有解析到参数，用下方「额外命令行参数」直接写。</p>
@@ -1192,178 +1295,222 @@ function PerRunEditor({ template, plan, onChange, onCancel }) {
   );
 }
 
-function ArgRow({ arg, vals, tweaked, perRun, plan, onChange, onSweep, onPerRun }) {
+function ArgRow({ arg, vals, tweaked, perRun, pinned, folded, plan, onChange, onSweep, onPerRun, onPin, onFold }) {
   const req = arg.required;
   const boolLike = arg.type === "bool" || arg.action === "store_true" || arg.action === "store_false";
   const singleChoice = !perRun && arg.choices && arg.choices.length && vals.length <= 1;
   const dims = plan?.dims || [];
   const total = plan?.count || 1;
   const collides = !perRun && total > 1 && vals.length === 1 && looksLikeArtifact(arg);
-
-  if (perRun) {
-    return (
-      <div className="min-w-0 border-b border-line py-3 last:border-b-0">
-        <ArgHead arg={arg} req={req} badge="每组唯一" />
-        {arg.help ? <div className="mt-1 min-w-0 text-xs break-all text-muted">{arg.help}</div> : null}
-        <PerRunEditor
-          template={String(vals[0] ?? "")}
-          plan={plan}
-          onChange={(next) => onPerRun(true, next)}
-          onCancel={() => onPerRun(false)}
-        />
-      </div>
-    );
-  }
+  const summary = formatArgSummary(arg, vals);
+  const badge = perRun ? "每组唯一" : vals.length > 1 ? `网格 ×${vals.length}` : "";
 
   return (
-    <div className="min-w-0 border-b border-line py-3 last:border-b-0">
-      <ArgHead arg={arg} req={req} badge={vals.length > 1 ? `网格 ×${vals.length}` : ""} />
-      {arg.help ? <div className="mt-1 min-w-0 text-xs break-all text-muted">{arg.help}</div> : null}
-      {isNargsList(arg) ? (
-        <div className="mt-1 text-xs text-muted">空格分隔多个值，对应 --flag 1 2 3 4；逗号也会当成分隔符。点「+ 多值」才是消融成多条任务。</div>
-      ) : null}
-      {tweaked ? (
-        <div className="mt-1 min-w-0 text-xs break-all text-muted">
-          本机没有 CUDA，已从默认 {String(arg.default)} 改为 {String(vals[0])}
-        </div>
-      ) : null}
-      {collides ? (
-        <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-lg border border-warn/35 bg-warn-soft/40 px-2 py-1.5 text-xs text-warn">
-          <span className="min-w-0">这看着像产物路径，{total} 组会全写到同一个地方。</span>
-          <button
-            type="button"
-            className="rounded-md border border-warn/40 px-1.5 py-0.5 text-[11px] hover:bg-warn/15"
-            onClick={() => onPerRun(true, suggestTemplate(vals[0], dims))}
-          >
-            设为每组唯一
-          </button>
-        </div>
-      ) : null}
-      <div className="mt-2 flex flex-wrap items-center gap-2">
-        {boolLike ? (
-          <>
-            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-              {vals.map((v, i) => (
-                <span key={i} className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-hover px-2 py-1">
-                  <Toggle
-                    on={isTruthy(v)}
-                    onClick={() => {
-                      const next = [...vals];
-                      next[i] = !isTruthy(v);
-                      onChange(next);
-                    }}
-                  />
-                  <span className="text-xs text-muted">{isTruthy(v) ? "true" : "false"}</span>
-                  {vals.length > 1 && (
-                    <button
-                      type="button"
-                      className="px-1 text-muted"
-                      onClick={() => {
-                        const next = vals.filter((_, idx) => idx !== i);
-                        onChange(next.length ? next : [false]);
-                      }}
-                    >
-                      ×
-                    </button>
-                  )}
-                </span>
-              ))}
+    <div className={`min-w-0 border-b border-line py-3 last:border-b-0 ${pinned ? "bg-ember-soft/25" : ""}`}>
+      <ArgHead
+        arg={arg}
+        req={req}
+        badge={badge}
+        pinned={pinned}
+        folded={folded}
+        summary={folded ? summary : ""}
+        onPin={onPin}
+        onFold={onFold}
+      />
+      {folded ? null : (
+        <>
+          {arg.help ? <div className="mt-1 min-w-0 pl-12 text-xs break-all text-muted">{arg.help}</div> : null}
+          {perRun ? (
+            <div className="pl-12">
+              <PerRunEditor
+                template={String(vals[0] ?? "")}
+                plan={plan}
+                onChange={(next) => onPerRun(true, next)}
+                onCancel={() => onPerRun(false)}
+              />
             </div>
-            {!(vals.some(isTruthy) && vals.some((v) => !isTruthy(v))) ? (
-              <Button
-                size="sm"
-                title="再加 true 或 false，生成消融任务"
-                onClick={() => onChange([...vals, !isTruthy(vals[0])])}
-              >
-                + 多值
-              </Button>
-            ) : null}
-          </>
-        ) : singleChoice ? (
-          <>
-            <select className="flex-1" value={vals[0]} onChange={(e) => onChange([e.target.value])}>
-              {arg.choices.map((c) => (
-                <option key={String(c)} value={c}>
-                  {String(c)}
-                </option>
-              ))}
-            </select>
-            <Button size="sm" title="添加一组值，生成消融任务" onClick={onSweep}>
-              + 多值
-            </Button>
-          </>
-        ) : (
-          <>
-            <div className="flex min-w-0 flex-1 flex-wrap gap-1.5">
-              {vals.map((v, i) => (
-                <span
-                  key={i}
-                  className={`flex min-w-0 items-center gap-1 rounded-lg border border-line bg-hover p-0.5 ${
-                    vals.length === 1 ? "w-full" : "min-w-[12rem] flex-1 basis-[12rem]"
-                  }`}
-                >
-                  <input
-                    className="min-w-0 flex-1 border-0 bg-transparent py-1 pr-2 pl-2"
-                    value={Array.isArray(v) ? formatNargs(v) : v}
-                    placeholder={isNargsList(arg) ? "1 2 3 4" : undefined}
-                    onChange={(e) => {
-                      const next = [...vals];
-                      next[i] = e.target.value;
-                      onChange(next);
-                    }}
-                  />
-                  {vals.length > 1 && (
-                    <button
-                      type="button"
-                      className="shrink-0 px-1.5 text-muted"
-                      onClick={() => {
-                        const next = vals.filter((_, idx) => idx !== i);
-                        onChange(next.length ? next : [""]);
-                      }}
-                    >
-                      ×
-                    </button>
-                  )}
-                </span>
-              ))}
-            </div>
-            <Button size="sm" title="添加一组值，参与笛卡尔积" onClick={onSweep}>
-              + 多值
-            </Button>
-            {vals.length === 1 && !isNargsList(arg) && templatable(arg) ? (
-              <Button
-                size="sm"
-                title="不参与相乘：写成模板，每组展开成不同的值"
-                onClick={() => onPerRun(true, suggestTemplate(vals[0], dims))}
-              >
-                每组唯一
-              </Button>
-            ) : null}
-          </>
-        )}
-      </div>
+          ) : (
+            <>
+              {isNargsList(arg) ? (
+                <div className="mt-1 pl-12 text-xs text-muted">
+                  空格分隔多个值，对应 --flag 1 2 3 4；逗号也会当成分隔符。点「+ 多值」才是消融成多条任务。
+                </div>
+              ) : null}
+              {tweaked ? (
+                <div className="mt-1 min-w-0 pl-12 text-xs break-all text-muted">
+                  本机没有 CUDA，已从默认 {String(arg.default)} 改为 {String(vals[0])}
+                </div>
+              ) : null}
+              {collides ? (
+                <div className="mt-1.5 ml-12 flex flex-wrap items-center gap-2 rounded-lg border border-warn/35 bg-warn-soft/40 px-2 py-1.5 text-xs text-warn">
+                  <span className="min-w-0">这看着像产物路径，{total} 组会全写到同一个地方。</span>
+                  <button
+                    type="button"
+                    className="rounded-md border border-warn/40 px-1.5 py-0.5 text-[11px] hover:bg-warn/15"
+                    onClick={() => onPerRun(true, suggestTemplate(vals[0], dims))}
+                  >
+                    设为每组唯一
+                  </button>
+                </div>
+              ) : null}
+              <div className="mt-2 flex flex-wrap items-center gap-2 pl-12">
+                {boolLike ? (
+                  <>
+                    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                      {vals.map((v, i) => (
+                        <span key={i} className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-hover px-2 py-1">
+                          <Toggle
+                            on={isTruthy(v)}
+                            onClick={() => {
+                              const next = [...vals];
+                              next[i] = !isTruthy(v);
+                              onChange(next);
+                            }}
+                          />
+                          <span className="text-xs text-muted">{isTruthy(v) ? "true" : "false"}</span>
+                          {vals.length > 1 && (
+                            <button
+                              type="button"
+                              className="px-1 text-muted"
+                              onClick={() => {
+                                const next = vals.filter((_, idx) => idx !== i);
+                                onChange(next.length ? next : [false]);
+                              }}
+                            >
+                              ×
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                    {!(vals.some(isTruthy) && vals.some((v) => !isTruthy(v))) ? (
+                      <Button
+                        size="sm"
+                        title="再加 true 或 false，生成消融任务"
+                        onClick={() => onChange([...vals, !isTruthy(vals[0])])}
+                      >
+                        + 多值
+                      </Button>
+                    ) : null}
+                  </>
+                ) : singleChoice ? (
+                  <>
+                    <select className="flex-1" value={vals[0]} onChange={(e) => onChange([e.target.value])}>
+                      {arg.choices.map((c) => (
+                        <option key={String(c)} value={c}>
+                          {String(c)}
+                        </option>
+                      ))}
+                    </select>
+                    <Button size="sm" title="添加一组值，生成消融任务" onClick={onSweep}>
+                      + 多值
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex min-w-0 flex-1 flex-wrap gap-1.5">
+                      {vals.map((v, i) => (
+                        <span
+                          key={i}
+                          className={`flex min-w-0 items-center gap-1 rounded-lg border border-line bg-hover p-0.5 ${
+                            vals.length === 1 ? "w-full" : "min-w-[12rem] flex-1 basis-[12rem]"
+                          }`}
+                        >
+                          <input
+                            className="min-w-0 flex-1 border-0 bg-transparent py-1 pr-2 pl-2"
+                            value={Array.isArray(v) ? formatNargs(v) : v}
+                            placeholder={isNargsList(arg) ? "1 2 3 4" : undefined}
+                            onChange={(e) => {
+                              const next = [...vals];
+                              next[i] = e.target.value;
+                              onChange(next);
+                            }}
+                          />
+                          {vals.length > 1 && (
+                            <button
+                              type="button"
+                              className="shrink-0 px-1.5 text-muted"
+                              onClick={() => {
+                                const next = vals.filter((_, idx) => idx !== i);
+                                onChange(next.length ? next : [""]);
+                              }}
+                            >
+                              ×
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                    <Button size="sm" title="添加一组值，参与笛卡尔积" onClick={onSweep}>
+                      + 多值
+                    </Button>
+                    {vals.length === 1 && !isNargsList(arg) && templatable(arg) ? (
+                      <Button
+                        size="sm"
+                        title="不参与相乘：写成模板，每组展开成不同的值"
+                        onClick={() => onPerRun(true, suggestTemplate(vals[0], dims))}
+                      >
+                        每组唯一
+                      </Button>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            </>
+          )}
+        </>
+      )}
     </div>
   );
 }
 
-function ArgHead({ arg, req, badge }) {
+function ArgHead({ arg, req, badge, pinned, folded, summary, onPin, onFold }) {
   return (
-    <div className="flex min-w-0 items-baseline justify-between gap-3">
-      <span className="flex min-w-0 items-baseline gap-1.5">
-        <span className="min-w-0 font-mono text-[13px] break-all">
-          {arg.name} {req ? <span className="text-bad">*</span> : null}
-        </span>
-        {badge ? (
-          <span
-            className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] ${
-              badge === "每组唯一" ? "bg-ember-soft text-ember" : "bg-hover text-muted"
-            }`}
-          >
-            {badge}
+    <div className="flex min-w-0 items-start justify-between gap-2">
+      <span className="flex min-w-0 items-start gap-1">
+        <button
+          type="button"
+          className={`mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded text-[10px] ${
+            pinned ? "bg-ember text-white" : "text-muted hover:bg-hover hover:text-text"
+          }`}
+          title={pinned ? "取消置顶" : "置顶，方便只盯着改这些"}
+          aria-pressed={!!pinned}
+          onClick={onPin}
+        >
+          ▲
+        </button>
+        <button
+          type="button"
+          className="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded text-[9px] text-muted hover:bg-hover hover:text-text"
+          title={folded ? "展开此项" : "折叠此项"}
+          aria-expanded={!folded}
+          onClick={onFold}
+        >
+          <span className={`inline-block transition-transform ${folded ? "-rotate-90" : ""}`}>▼</span>
+        </button>
+        <span className="min-w-0 pt-0.5">
+          <span className="flex min-w-0 flex-wrap items-baseline gap-1.5">
+            <span className="min-w-0 font-mono text-[13px] break-all">
+              {arg.name} {req ? <span className="text-bad">*</span> : null}
+            </span>
+            {badge ? (
+              <span
+                className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] ${
+                  badge === "每组唯一" ? "bg-ember-soft text-ember" : "bg-hover text-muted"
+                }`}
+              >
+                {badge}
+              </span>
+            ) : null}
+            {folded && summary ? (
+              <span className="min-w-0 max-w-full truncate font-mono text-xs text-ember" title={summary}>
+                {summary}
+              </span>
+            ) : null}
           </span>
-        ) : null}
+        </span>
       </span>
-      <span className="min-w-0 max-w-[45%] text-right text-xs break-all text-muted">
+      <span className="min-w-0 max-w-[40%] pt-0.5 text-right text-xs break-all text-muted">
         {arg.type || ""}
         {arg.nargs ? ` · nargs=${arg.nargs}` : ""}
         {arg.default !== undefined && arg.default !== null ? ` · 默认 ${formatDefault(arg)}` : ""}
